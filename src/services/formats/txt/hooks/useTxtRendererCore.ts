@@ -1,4 +1,5 @@
 import { RenderOptions, TocItem } from '../../types';
+import { getReaderPageBackground } from '../../../../constants/readerTheme';
 
 export interface PageRange {
   index: number;
@@ -51,7 +52,8 @@ export interface TxtRendererCore {
     pages: PageRange[],
     options?: RenderOptions,
     startPageIndex?: number,
-    chapterTitles?: ChapterTitleMap
+    chapterTitles?: ChapterTitleMap,
+    charOffsetBase?: number
   ): void;
   prependContentWithPageDividers(
     container: HTMLElement,
@@ -59,18 +61,21 @@ export interface TxtRendererCore {
     pages: PageRange[],
     options?: RenderOptions,
     startPageIndex?: number,
-    chapterTitles?: ChapterTitleMap
+    chapterTitles?: ChapterTitleMap,
+    charOffsetBase?: number
   ): void;
 }
 
 function getThemeColors(theme: string | undefined) {
+  // 页面底色统一取自主题常量；文字色仍由各格式自行维护
+  const bg = getReaderPageBackground(theme);
   if (theme === 'dark') {
-    return { bg: '#1a1a1a', text: '#e0e0e0' };
+    return { bg, text: '#e0e0e0' };
   }
   if (theme === 'sepia') {
-    return { bg: '#f4ecd8', text: '#5b4636' };
+    return { bg, text: '#5b4636' };
   }
-  return { bg: '#fff', text: '#333' };
+  return { bg, text: '#333' };
 }
 
 function applyContainerStyles(
@@ -98,9 +103,16 @@ function applyContainerStyles(
     `;
 }
 
+/**
+ * 创建段落元素
+ * @param charOffset 该行在全文中的字符起始偏移（用于进度精确换算，渲染时标注到 DOM）
+ * @param charLength 该行文本长度（不含换行符）
+ */
 function createParagraphElement(
   text: string,
-  isVertical: boolean = false
+  isVertical: boolean = false,
+  charOffset?: number,
+  charLength?: number
 ): HTMLParagraphElement {
   const p = document.createElement('p');
   p.style.cssText = `
@@ -112,6 +124,11 @@ function createParagraphElement(
         white-space: pre-wrap;
       `;
   p.textContent = text;
+  // 标注字符区间，供进度换算（视口/页 ↔ 字符偏移）精确定位
+  if (typeof charOffset === 'number') {
+    p.setAttribute('data-char-offset', String(charOffset));
+    p.setAttribute('data-char-length', String(charLength ?? text.length));
+  }
   return p;
 }
 
@@ -119,7 +136,9 @@ function createParagraphElement(
 function createChapterTitleElement(
   text: string,
   level: number,
-  isVertical: boolean = false
+  isVertical: boolean = false,
+  charOffset?: number,
+  charLength?: number
 ): HTMLElement {
   const h = document.createElement('h3');
   h.style.cssText = `
@@ -140,6 +159,11 @@ function createChapterTitleElement(
   }
   h.textContent = text;
   h.setAttribute('data-chapter-title', 'true');
+  // 标注字符区间（标题行也参与进度精确换算）
+  if (typeof charOffset === 'number') {
+    h.setAttribute('data-char-offset', String(charOffset));
+    h.setAttribute('data-char-length', String(charLength ?? text.length));
+  }
   return h;
 }
 
@@ -403,11 +427,12 @@ export function useTxtRendererCore(): TxtRendererCore {
 
     for (const line of lines) {
       const titleLevel = chapterTitles?.get(line.startOffset);
+      const charLength = line.endOffset - line.startOffset;
       if (titleLevel !== undefined) {
-        const el = createChapterTitleElement(line.text, titleLevel, isVertical);
+        const el = createChapterTitleElement(line.text, titleLevel, isVertical, line.startOffset, charLength);
         container.appendChild(el);
       } else {
-        const p = createParagraphElement(line.text, isVertical);
+        const p = createParagraphElement(line.text, isVertical, line.startOffset, charLength);
         container.appendChild(p);
       }
     }
@@ -444,6 +469,7 @@ export function useTxtRendererCore(): TxtRendererCore {
   /**
    * 追加内容带分页分隔符
    * 用于连续滚动模式，不清空容器，直接追加新内容
+   * @param charOffsetBase 追加内容在拼接 _content 中的起始字符偏移（用于段落标注与进度换算）
    */
   const appendContentWithPageDividers = (
     container: HTMLElement,
@@ -451,7 +477,8 @@ export function useTxtRendererCore(): TxtRendererCore {
     pages: PageRange[],
     options?: RenderOptions,
     startPageIndex: number = 0,
-    chapterTitles?: ChapterTitleMap
+    chapterTitles?: ChapterTitleMap,
+    charOffsetBase: number = 0
   ): void => {
     // 在旧内容和新内容之间插入章节分隔符
     if (container.lastElementChild) {
@@ -476,11 +503,12 @@ export function useTxtRendererCore(): TxtRendererCore {
       container.appendChild(divider);
     }
 
-    _renderContentInternal(container, content, pages, options, startPageIndex, chapterTitles);
+    _renderContentInternal(container, content, pages, options, startPageIndex, chapterTitles, charOffsetBase);
   };
 
   /**
    * 内部渲染逻辑，支持追加模式
+   * @param charOffsetBase 该段内容在拼接 _content 中的起始字符偏移
    */
   const _renderContentInternal = (
     container: HTMLElement,
@@ -488,7 +516,8 @@ export function useTxtRendererCore(): TxtRendererCore {
     pages: PageRange[],
     options: RenderOptions | undefined,
     startPageIndex: number,
-    chapterTitles?: ChapterTitleMap
+    chapterTitles?: ChapterTitleMap,
+    charOffsetBase: number = 0
   ): void => {
     const lines = splitContentIntoLines(content);
 
@@ -506,11 +535,13 @@ export function useTxtRendererCore(): TxtRendererCore {
 
       for (const line of lines) {
         const titleLevel = chapterTitles?.get(line.startOffset);
+        const charLength = line.endOffset - line.startOffset;
+        const charOffset = charOffsetBase + line.startOffset;
         if (titleLevel !== undefined) {
-          const el = createChapterTitleElement(line.text, titleLevel, true);
+          const el = createChapterTitleElement(line.text, titleLevel, true, charOffset, charLength);
           wrapper.appendChild(el);
         } else {
-          const p = createParagraphElement(line.text, true);
+          const p = createParagraphElement(line.text, true, charOffset, charLength);
           wrapper.appendChild(p);
         }
       }
@@ -582,11 +613,13 @@ export function useTxtRendererCore(): TxtRendererCore {
 
       // 将行添加到当前页（标题行使用标题样式）
       const titleLevel = chapterTitles?.get(line.startOffset);
+      const charLength = line.endOffset - line.startOffset;
+      const charOffset = charOffsetBase + line.startOffset;
       if (titleLevel !== undefined) {
-        const el = createChapterTitleElement(line.text, titleLevel, true);
+        const el = createChapterTitleElement(line.text, titleLevel, true, charOffset, charLength);
         currentWrapper.appendChild(el);
       } else {
-        const p = createParagraphElement(line.text, true);
+        const p = createParagraphElement(line.text, true, charOffset, charLength);
         currentWrapper.appendChild(p);
       }
     }
@@ -594,6 +627,7 @@ export function useTxtRendererCore(): TxtRendererCore {
 
   /**
    * 向容器前方插入内容，保持现有内容不变
+   * @param charOffsetBase 插入内容在拼接 _content 中的起始字符偏移（prepend 后新章位于 0）
    */
   const prependContentWithPageDividers = (
     container: HTMLElement,
@@ -601,11 +635,12 @@ export function useTxtRendererCore(): TxtRendererCore {
     pages: PageRange[],
     options?: RenderOptions,
     startPageIndex: number = 0,
-    chapterTitles?: ChapterTitleMap
+    chapterTitles?: ChapterTitleMap,
+    charOffsetBase: number = 0
   ): void => {
     const fragment = document.createDocumentFragment();
     const tempDiv = document.createElement('div');
-    _renderContentInternal(tempDiv, content, pages, options, startPageIndex, chapterTitles);
+    _renderContentInternal(tempDiv, content, pages, options, startPageIndex, chapterTitles, charOffsetBase);
     while (tempDiv.firstChild) {
       fragment.appendChild(tempDiv.firstChild);
     }

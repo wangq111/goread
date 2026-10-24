@@ -29,6 +29,10 @@ internal data class TTSSessionSegment(
   val chunkIndex: Int,
   val cursor: String?,
   val anchor: TTSSessionAnchor?,
+  /** 所属章节整章可朗读字符数（后端切片时计算，前端估算总时长用） */
+  val sectionSpeakableLength: Int?,
+  /** 所属章节总 chunk 数（前端按文本比例推进进度条） */
+  val sectionChunkCount: Int?,
 )
 
 internal enum class TTSSessionState {
@@ -112,10 +116,10 @@ internal class TTSEngineRunner(
     }
   }
 
-  fun stop(emitStoppedEvent: Boolean = true) {
-    println("[TTS][Engine] session_stop emitStoppedEvent=$emitStoppedEvent")
+  fun stop(emitStoppedEvent: Boolean = true, stopForeground: Boolean = true) {
+    println("[TTS][Engine] session_stop emitStoppedEvent=$emitStoppedEvent stopForeground=$stopForeground")
     val prev = state
-    resetInternal(stopForeground = true)
+    resetInternal(stopForeground = stopForeground)
     state = TTSSessionState.Stopped
     // 启动前清理旧会话时不再向前端补发 stopped，避免误伤新会话。
     if (emitStoppedEvent && prev != TTSSessionState.Idle && prev != TTSSessionState.Completed) {
@@ -243,6 +247,8 @@ internal class TTSEngineRunner(
       chunkIndex = args.chunkIndex ?: 0,
       cursor = args.cursor,
       anchor = anchor,
+      sectionSpeakableLength = args.sectionSpeakableLength,
+      sectionChunkCount = args.sectionChunkCount,
     )
   }
 
@@ -310,7 +316,7 @@ internal class TTSEngineRunner(
       val params = android.os.Bundle().apply {
         putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
       }
-      println("[TTS][Engine] speak: utteranceId=$utteranceId segmentId=${segment.id} sectionIndex=${segment.sectionIndex} chunkIndex=${segment.chunkIndex} textLen=${segment.text.length}")
+      println("[TTS][Engine] speak: utteranceId=$utteranceId segmentId=${segment.id} sectionIndex=${segment.sectionIndex} chunkIndex=${segment.chunkIndex} textLen=${segment.text.length} sectionSpeakable=${segment.sectionSpeakableLength ?: -1}")
       val result = tts.speak(segment.text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
       if (result != TextToSpeech.SUCCESS) {
         synchronized(lock) {
@@ -410,6 +416,14 @@ internal class TTSEngineRunner(
       put("segmentId", segment.id)
       put("sectionIndex", segment.sectionIndex)
       put("chunkIndex", segment.chunkIndex)
+      // 带上当前句文本：前端可用于媒体通知动态文案（后台渲染暂停时仍可更新）
+      put("text", segment.text.take(300))
+      // 完整句的可朗读字符数（不受上面截断影响），供前端做语速校准
+      put("speakableLength", segment.text.count { !it.isWhitespace() })
+      // 整章可朗读字符数：前端据此计算章节总时长（跨章/后台都可靠）
+      segment.sectionSpeakableLength?.let { put("sectionSpeakableLength", it) }
+      // 整章 chunk 总数：前端用 chunkIndex / sectionChunkCount 推进文本进度
+      segment.sectionChunkCount?.let { put("sectionChunkCount", it) }
       segment.cursor?.let { put("cursor", it) }
       putAnchor(this, segment.anchor)
     }
@@ -420,6 +434,10 @@ internal class TTSEngineRunner(
     val data = JSObject().apply {
       put("code", "session_segment_done")
       put("segmentId", segment.id)
+      // 带上章节/ chunk 信息：前端据此把文本进度推进到该 chunk 完成
+      put("sectionIndex", segment.sectionIndex)
+      put("chunkIndex", segment.chunkIndex)
+      segment.sectionChunkCount?.let { put("sectionChunkCount", it) }
       segment.cursor?.let { put("cursor", it) }
     }
     emitEvent(data)

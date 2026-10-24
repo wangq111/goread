@@ -5,14 +5,16 @@ mod formats;
 mod html_commands;
 mod markdown_commands;
 mod models;
-mod pdf;
 mod pdf_commands;
 mod tts;
 mod tts_commands;
 mod txt_commands;
 mod mobi_commands;
+mod wifi_transfer;
 
 // 导入所有命令
+use wifi_transfer::{wifi_list_uploads, wifi_stage_to_library, wifi_transfer_start, wifi_transfer_status, wifi_transfer_stop};
+use commands::webdav::{nas_cache_clear, nas_cache_stats, nas_open_remote, webdav_download, webdav_list};
 use commands::{
     add_book,
     // bookmark commands
@@ -45,6 +47,7 @@ use commands::{
     frontend_log,
     get_all_books,
     get_all_groups,
+    find_group_by_name,
     get_bookmarks,
     get_books_by_date_range,
     get_books_by_group,
@@ -70,7 +73,6 @@ use commands::{
     reorder_recent_books,
     reset_all_book_themes,
     request_storage_permission,
-    save_image_to_gallery,
     // stats commands
     save_reading_session,
     scan_book_files,
@@ -160,6 +162,17 @@ async fn native_tts_set_media_session_active<R: Runtime>(
 ) -> Result<(), String> {
     app.native_tts()
         .set_media_session_active(payload)
+        .map_err(|e| e.to_string())
+}
+
+/// 同步朗读播放状态到 Android 前台服务媒体通知（由前端 TTSSession 回写）
+#[tauri::command]
+async fn native_tts_set_playback_state<R: Runtime>(
+    app: AppHandle<R>,
+    payload: tauri_plugin_native_tts::SetPlaybackStateRequest,
+) -> Result<(), String> {
+    app.native_tts()
+        .set_playback_state(payload)
         .map_err(|e| e.to_string())
 }
 
@@ -307,6 +320,8 @@ pub fn run() {
         .plugin(tauri_plugin_ios_bridge::init())
         .setup(|app| {
             app.manage(Arc::new(ManagedTtsSessionState::new()));
+            // 初始化 WiFi 传书状态（服务默认未启动）
+            app.manage(wifi_transfer::WifiTransferState::new());
             // 设置数据库连接
             tauri::async_runtime::block_on(async {
                 let app_data_dir = app.path().app_data_dir().unwrap();
@@ -355,15 +370,15 @@ pub fn run() {
 
                 if let Ok(res_dir) = app.path().resource_dir() {
                     #[cfg(target_os = "windows")]
-                    let sub = "pdfium/windows";
+                    let sub = "pdf/pdfium/windows";
                     #[cfg(target_os = "linux")]
-                    let sub = "pdfium/linux";
+                    let sub = "pdf/pdfium/linux";
                     #[cfg(target_os = "macos")]
-                    let sub = "pdfium/macos";
+                    let sub = "pdf/pdfium/macos";
                     #[cfg(target_os = "android")]
-                    let sub = "pdfium/android";
+                    let sub = "pdf/pdfium/android";
                     #[cfg(target_os = "ios")]
-                    let sub = "pdfium/ios";
+                    let sub = "pdf/pdfium/ios";
                     let full = res_dir.join(sub);
                     let p = full.to_string_lossy().replace('\\', "/");
                     unsafe {
@@ -395,6 +410,7 @@ pub fn run() {
             rename_book,
             add_group,
             get_all_groups,
+            find_group_by_name,
             update_group,
             delete_group,
             get_books_by_group,
@@ -414,11 +430,22 @@ pub fn run() {
             check_storage_permission,
             request_storage_permission,
             read_file_bytes,
-            save_image_to_gallery,
             // 批量导入优化命令
             batch_read_files,
             batch_import_books,
             batch_get_pdf_info,
+            // WiFi 传书命令
+            wifi_transfer_start,
+            wifi_transfer_stop,
+            wifi_transfer_status,
+            wifi_stage_to_library,
+            wifi_list_uploads,
+            // NAS WebDAV 命令
+            webdav_list,
+            webdav_download,
+            nas_open_remote,
+            nas_cache_stats,
+            nas_cache_clear,
             frontend_log,
             read_file_base64,
             read_file_chunked,
@@ -476,6 +503,7 @@ pub fn run() {
             native_tts_set_rate,
             native_tts_set_voice,
             native_tts_set_media_session_active,
+            native_tts_set_playback_state,
             native_tts_shutdown,
             native_tts_session_start,
             native_tts_session_push,
@@ -537,7 +565,8 @@ pub fn run() {
             mobi_load_metadata,
             mobi_prepare_book,
             epub_inspect,
-            epub_prepare_book
+            epub_prepare_book,
+            epub_resolve_hidden_sections
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

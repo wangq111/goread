@@ -25,6 +25,8 @@ export interface BackendTTSRequest {
   fallbackSectionIndex?: number;
   totalSections?: number;
   readingMode?: 'horizontal' | 'vertical';
+  /** 不参与阅读顺序的章节下标（EPUB3 导航文档等），TTS 需跳过 */
+  hiddenSections?: number[];
 }
 
 /** Provider 取片请求 */
@@ -36,6 +38,21 @@ export interface TTSContentProviderGetSegmentsRequest {
   /** 用户当前阅读位置（仅 cursor=null 时使用） */
   startPosition?: TTSReadingPosition | null;
 }
+
+/**
+ * 解析 provider 的起播位置：cursor 优先；否则用调用方显式传入的 startPosition；
+ * 最后回退到渲染器提供的可视区域起点。
+ *
+ * EPUB/MOBI/TXT 的规则完全一致，集中在这里避免各 provider 复制。
+ */
+export const resolveProviderStartPosition = (
+  req: TTSContentProviderGetSegmentsRequest,
+  getVisibleStartPosition?: () => TTSReadingPosition | null,
+): TTSReadingPosition | null => {
+  if (req.cursor) return null;
+  if (req.startPosition) return req.startPosition;
+  return getVisibleStartPosition?.() ?? null;
+};
 
 /** Provider 取片响应 */
 export interface TTSContentProviderBatch {
@@ -76,6 +93,33 @@ export interface TTSContentProvider {
 
   /** 文档因翻页/重排/资源切换被销毁时由 TTSSession 调用 */
   notifyDocumentUpdated(): void;
+
+  /**
+   * 章节文本长度（字符数）。
+   * 用于媒体通知的时长估算（章节级进度条）；不支持时返回 null。
+   */
+  getSectionTextLength?(sectionIndex: number): number | null;
+
+  /**
+   * 按章节内文本比例生成可朗读起点 anchor。
+   * 用于媒体通知进度条拖动定位；不支持时返回 null。
+   */
+  buildAnchorAtRatio?(sectionIndex: number, ratio: number): TTSReadingAnchor | null;
+
+  /** 章节内“可朗读字符数”（去掉空白/换行），用于时长估算 */
+  getSectionSpeakableLength?(sectionIndex: number): number | null;
+
+  /** 相邻章节索引（跳过 EPUB 隐藏章节等）；无相邻章节时返回 null */
+  getAdjacentSectionIndex?(current: number, direction: 'prev' | 'next'): number | null;
+
+  /** 章节标题（用于媒体通知随朗读章节更新）；未知时返回 null */
+  getSectionTitle?(sectionIndex: number): string | null;
+
+  /**
+   * 章节内 anchor 的近似字符偏移。
+   * 用于起播位置不是章首时，初始化进度条基准；不支持时返回 null。
+   */
+  getAnchorTextOffset?(sectionIndex: number, anchor: TTSReadingAnchor | null | undefined): number | null;
 }
 
 /**

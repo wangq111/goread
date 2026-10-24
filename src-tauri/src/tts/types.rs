@@ -1,5 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+
+/// TTS 支持的书籍格式。
+///
+/// 请求 DTO 仍用字符串跨 IPC 传输，进入 Rust 后统一解析成枚举，
+/// 避免在命令层反复对 `format.as_str()` 做字符串 switch。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtsFormat {
+    Epub,
+    Mobi,
+    Txt,
+}
+
+impl TtsFormat {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "epub" => Some(Self::Epub),
+            "mobi" => Some(Self::Mobi),
+            "txt" => Some(Self::Txt),
+            _ => None,
+        }
+    }
+}
+
 /// 朗读定位锚点：与前端 TTSReadingAnchor 字段一致
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TtsAnchorDto {
@@ -23,6 +46,12 @@ pub struct TtsSegmentDto {
     pub cursor: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anchor: Option<TtsAnchorDto>,
+    /// 该片段所属章节的整章可朗读字符数（去空白），用于前端估算章节总时长
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_speakable_length: Option<u32>,
+    /// 该片段所属章节的总 chunk 数，用于前端按“已读文本比例”推进进度条
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_chunk_count: Option<u32>,
 }
 
 /// 起播位置：用户当前阅读处
@@ -53,6 +82,9 @@ pub struct TtsGetSegmentsRequest {
     /// EPUB 横纵向模式（仅 EPUB 用）
     #[serde(default)]
     pub reading_mode: Option<String>,
+    /// 不参与阅读顺序的章节下标（EPUB3 导航文档等），TTS 需跳过
+    #[serde(default)]
+    pub hidden_sections: Option<Vec<i32>>,
 }
 
 /// 取片响应：与前端 TTSContentProviderBatch 字段一致

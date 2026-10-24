@@ -12,6 +12,7 @@ import type {
   TTSSessionRequestMoreEvent,
   TTSSessionSegmentDoneEvent,
   TTSSessionWaitingMoreEvent,
+  TTSMediaAction,
 } from '../types';
 import {
   invokeTTSManagedSessionPause,
@@ -22,6 +23,7 @@ import {
   invokeTTSManagedSessionStop,
 } from '../providers/backendBridge';
 import { loadTauriCore } from '../core/tauriCore';
+import { stripSpeechQuotes } from '../core/speechText';
 import { log, logError } from '../../index';
 
 /** 注入给 NativeSessionDriver 的最小依赖 */
@@ -50,6 +52,18 @@ type NativeEventPayload = {
   message?: string;
   prevEngine?: string;
   engine?: string;
+  /** 媒体控件动作（code=media_action 时下发） */
+  action?: string;
+  /** 进度条拖动目标位置（ms，章节内） */
+  positionMs?: number;
+  /** 当前句文本（code=session_progress 时下发） */
+  text?: string;
+  /** 当前句可朗读字符数（完整句） */
+  speakableLength?: number;
+  /** 当前章节整章可朗读字符数 */
+  sectionSpeakableLength?: number;
+  /** 当前章节总 chunk 数 */
+  sectionChunkCount?: number;
   anchor?: { quote?: string; prefix?: string; suffix?: string } | null;
 };
 
@@ -203,6 +217,10 @@ export class NativeSessionDriver implements IBackendSessionDriver {
           sectionIndex: event.sectionIndex ?? 0,
           chunkIndex: event.chunkIndex ?? 0,
           cursor: event.cursor,
+          text: event.text,
+          speakableLength: event.speakableLength,
+          sectionSpeakableLength: event.sectionSpeakableLength,
+          sectionChunkCount: event.sectionChunkCount,
           anchor: event.anchor && event.anchor.quote
             ? {
                 quote: event.anchor.quote,
@@ -232,6 +250,9 @@ export class NativeSessionDriver implements IBackendSessionDriver {
         const payload: TTSSessionSegmentDoneEvent = {
           segmentId: event.segmentId ?? '',
           cursor: event.cursor,
+          sectionIndex: event.sectionIndex,
+          chunkIndex: event.chunkIndex,
+          sectionChunkCount: event.sectionChunkCount,
         };
         listeners.onSegmentDone?.(payload);
         return true;
@@ -270,6 +291,29 @@ export class NativeSessionDriver implements IBackendSessionDriver {
           prevEngine: event.prevEngine,
           engine: event.engine,
         });
+        return true;
+      }
+      // 媒体控件（通知/锁屏/耳机按键）动作：交给会话层执行真正的暂停/继续/停止/跳转
+      case 'media_action': {
+        const action = event.action;
+        if (action === 'play' || action === 'pause' || action === 'stop') {
+          const mediaAction: TTSMediaAction = action;
+          listeners.onMediaAction?.(mediaAction);
+          return true;
+        }
+        if (action === 'seek') {
+          listeners.onMediaAction?.('seek', event.positionMs);
+          return true;
+        }
+        if (action === 'prev-chapter' || action === 'next-chapter') {
+          listeners.onMediaAction?.(action);
+          return true;
+        }
+        return false;
+      }
+      // 后台保活服务启动失败（Android 12+ 后台启动限制等）
+      case 'background_service_error': {
+        listeners.onBackgroundServiceError?.(event.reason);
         return true;
       }
       default:
@@ -317,21 +361,31 @@ export class NativeSessionDriver implements IBackendSessionDriver {
     chunkIndex: number;
     cursor?: string;
     anchor?: { quote: string; prefix?: string; suffix?: string } | null;
+    sectionSpeakableLength?: number;
+    sectionChunkCount?: number;
   }> {
-    return segments.map((seg) => ({
-      id: seg.id,
-      text: seg.text,
-      lang: seg.lang ? this.#options.toBCP47(seg.lang) : undefined,
-      sectionIndex: seg.sectionIndex,
-      chunkIndex: seg.chunkIndex,
-      cursor: seg.cursor,
-      anchor: seg.anchor
-        ? {
-            quote: seg.anchor.quote,
-            prefix: seg.anchor.prefix,
-            suffix: seg.anchor.suffix,
-          }
-        : null,
-    }));
+    // 朗读文本先剔除引号类符号；整段仅引号时无可朗读内容，直接丢弃该片段
+    // （停顿标点保留，anchor 保持原文，用于原生侧上报进度后的高亮定位）
+    return segments.flatMap((seg) => {
+      const text = stripSpeechQuotes(seg.text);
+      if (!text) return [];
+      return [{
+        id: seg.id,
+        text,
+        lang: seg.lang ? this.#options.toBCP47(seg.lang) : undefined,
+        sectionIndex: seg.sectionIndex,
+        chunkIndex: seg.chunkIndex,
+        cursor: seg.cursor,
+        sectionSpeakableLength: seg.sectionSpeakableLength,
+        sectionChunkCount: seg.sectionChunkCount,
+        anchor: seg.anchor
+          ? {
+              quote: seg.anchor.quote,
+              prefix: seg.anchor.prefix,
+              suffix: seg.anchor.suffix,
+            }
+          : null,
+      }];
+    });
   }
 }

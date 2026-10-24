@@ -57,6 +57,10 @@ export interface TTSSegment {
   chunkIndex: number;
   cursor: string;
   anchor?: TTSReadingAnchor | null;
+  /** 所属章节整章可朗读字符数（后端切片时计算，用于估算章节总时长） */
+  sectionSpeakableLength?: number;
+  /** 所属章节总 chunk 数（用于按文本比例推进进度条） */
+  sectionChunkCount?: number;
 }
 
 /** 会话进度事件：原生在每段开始播报时上抛 */
@@ -66,6 +70,14 @@ export interface TTSSessionProgressEvent {
   chunkIndex: number;
   cursor?: string;
   anchor?: TTSReadingAnchor | null;
+  /** 当前句文本（native-tts 插件模式下发，供通知动态文案使用；可能被截断） */
+  text?: string;
+  /** 当前句可朗读字符数（完整句，不截断；用于语速校准） */
+  speakableLength?: number;
+  /** 当前章节整章可朗读字符数（后端下发，跨章/后台都可靠） */
+  sectionSpeakableLength?: number;
+  /** 当前章节总 chunk 数（用于按文本比例推进进度条） */
+  sectionChunkCount?: number;
 }
 
 /** 会话补给请求：队列接近低水位时上抛 */
@@ -84,6 +96,12 @@ export interface TTSSessionWaitingMoreEvent {
 export interface TTSSessionSegmentDoneEvent {
   segmentId: string;
   cursor?: string;
+  /** 完成片段所属章节（用于文本进度） */
+  sectionIndex?: number;
+  /** 完成片段的 chunk 下标（进度推进到 chunkIndex + 1） */
+  chunkIndex?: number;
+  /** 所属章节总 chunk 数 */
+  sectionChunkCount?: number;
 }
 
 /** 暂停 / 恢复事件 */
@@ -107,6 +125,12 @@ export interface TTSSessionEngineChangedEvent {
   engine?: string;
 }
 
+/**
+ * 媒体控件动作（Android 通知/锁屏/耳机按键触发）
+ * play/pause/stop 为按钮；seek 为进度条拖动；prev-chapter/next-chapter 为章节跳转
+ */
+export type TTSMediaAction = 'play' | 'pause' | 'stop' | 'seek' | 'prev-chapter' | 'next-chapter';
+
 /** 会话事件统一回调集合 */
 export interface TTSSessionListeners {
   onProgress?: (event: TTSSessionProgressEvent) => void;
@@ -117,5 +141,9 @@ export interface TTSSessionListeners {
   onResumed?: (event: TTSSessionPauseStateEvent) => void;
   onEnd?: (event: TTSSessionEndEvent) => void;
   onEngineChanged?: (event: TTSSessionEngineChangedEvent) => void;
+  /** 媒体控件动作（仅 native-tts 插件模式会下发） */
+  onMediaAction?: (action: TTSMediaAction, positionMs?: number) => void;
+  /** 后台保活服务启动失败（仅 native-tts 插件模式会下发） */
+  onBackgroundServiceError?: (reason?: string) => void;
 }
 

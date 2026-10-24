@@ -1,8 +1,7 @@
 import React from "react";
 import { useTranslation } from "react-i18next";
-import { getSafeAreaInsets } from "../../utils/layout";
 
-export type DeleteContext = "recent" | "all-groups" | "group-detail";
+export type DeleteContext = "recent" | "all" | "group-detail";
 
 export interface ConfirmDeleteDrawerProps {
   open: boolean;
@@ -25,8 +24,8 @@ const ConfirmDeleteDrawer: React.FC<ConfirmDeleteDrawerProps> = ({
   const desc =
     context === "recent"
       ? t("deleteDrawer.descRecent", { count })
-      : context === "all-groups"
-        ? t("deleteDrawer.descAllGroups", { count })
+      : context === "all"
+        ? t("deleteDrawer.descAll", { count })
         : t("deleteDrawer.descGroupDetail", { count });
 
   const [deleteLocal, setDeleteLocal] = React.useState(false);
@@ -80,7 +79,7 @@ const ConfirmDeleteDrawer: React.FC<ConfirmDeleteDrawerProps> = ({
         >
           {desc}
         </div>
-        {["all-groups", "group-detail"].includes(context) && (
+        {["all", "group-detail"].includes(context) && (
           <button
             onClick={() => setDeleteLocal((v) => !v)}
             style={{
@@ -134,7 +133,8 @@ const ConfirmDeleteDrawer: React.FC<ConfirmDeleteDrawerProps> = ({
             display: "grid",
             gridTemplateColumns: "1fr 1fr",
             borderTop: "1px solid #eee",
-            padding: `12px 0 calc(12px + ${getSafeAreaInsets().bottom})`,
+            // 避让全局底部菜单栏（变量已含底部安全区高度）
+            padding: `12px 0 calc(12px + var(--goread-navbar-h))`,
           }}
         >
           <button

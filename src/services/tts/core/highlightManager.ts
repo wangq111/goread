@@ -1,3 +1,5 @@
+import { hasActiveSelectionIn, setProgrammaticSelectionActive } from '../../../utils/selection';
+
 export class HighlightManager {
   #highlightStyleInjected = false;
   #highlightStyleEl: HTMLStyleElement | null = null;
@@ -10,12 +12,16 @@ export class HighlightManager {
   #lastFollowContainer: Element | null = null;
 
   apply(range: Range): void {
+    // 用户正在选字：本句不刷新高亮（也不抢占选区），松手后下一句自然恢复
+    if (hasActiveSelectionIn(this.#asSelectionHost(this.#getScrollContainer(range)))) return;
     try {
       if (typeof CSS !== 'undefined' && 'highlights' in CSS) {
         const hl = new (globalThis as any).Highlight(range);
         (CSS as any).highlights.set('tts-reading', hl);
         this.#injectHighlightStyle(range);
         this.#clearOverlay();
+        // 走 CSS 高亮路径时不存在选区，清除程序化选区标记
+        setProgrammaticSelectionActive(false);
         return;
       }
     } catch {
@@ -24,6 +30,8 @@ export class HighlightManager {
 
     try {
       if (this.#applyOverlay(range)) {
+        // 覆盖层高亮不产生选区，清除程序化选区标记
+        setProgrammaticSelectionActive(false);
         return;
       }
     } catch {
@@ -37,6 +45,9 @@ export class HighlightManager {
       if (sel) {
         sel.removeAllRanges();
         sel.addRange(range);
+        // 该路径是用真实选区实现高亮：标记为程序化选区，
+        // 避免被误判为“用户正在选字”而钉住页面（影响 TTS 跟读滚动）
+        setProgrammaticSelectionActive(true);
       }
     } catch {
       // ignore
@@ -44,6 +55,8 @@ export class HighlightManager {
   }
 
   clear(): void {
+    // 高亮已清除：解除程序化选区标记
+    setProgrammaticSelectionActive(false);
     try {
       if (typeof CSS !== 'undefined' && 'highlights' in CSS) {
         (CSS as any).highlights.delete('tts-reading');
@@ -81,6 +94,8 @@ export class HighlightManager {
       const container = this.#getScrollContainer(range);
       if (!container) return;
 
+      // 用户正在选字：浏览器会为展示选区自动滚动，此时吸附会与它争夺滚动位置
+      if (hasActiveSelectionIn(this.#asSelectionHost(container))) return;
       const isEl = container instanceof HTMLElement;
       const hScrollable = isEl && container.scrollWidth > container.clientWidth + 1;
       const vScrollable = isEl && container.scrollHeight > container.clientHeight + 1;
@@ -301,6 +316,11 @@ export class HighlightManager {
     }
     this.#overlayHost = null;
     this.#overlayHostPrevPosition = null;
+  }
+
+  /** 选区宿主归一：只有 HTMLElement 才能作为选字判定目标 */
+  #asSelectionHost(container: Element | null): HTMLElement | null {
+    return container instanceof HTMLElement ? container : null;
   }
 
   #getScrollContainer(range: Range): Element | null {

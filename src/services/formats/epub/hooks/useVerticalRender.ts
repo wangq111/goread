@@ -16,7 +16,18 @@ import {
 import { epubCacheService } from '../epubCacheService';
 import { createDividerEl, toggleDividerVisibility, updateDividerStyle } from '../../../../components/reader/PageDivider';
 import { getTocHrefForSection } from './tocMapping';
-import { extractBodyContent } from '../../../../utils/htmlUtils';
+import {
+  createEpubReadingOrder,
+  nearestVisiblePage,
+  type EpubReadingOrder,
+} from './readingOrder';
+import { extractBodyContent, normalizeBookCssForShadow } from '../../../../utils/htmlUtils';
+import { parseFixedLayoutViewport } from '../layout/viewportSpec';
+import { createFixedLayoutStage, isFixedLayoutEnabled } from '../layout/fixedLayoutStage';
+import {
+  createFixedLayoutSectionManager,
+  type FixedLayoutSectionManager,
+} from '../layout/fixedLayoutSectionManager';
 import { stabilizeScrollTop } from './scrollStabilizer';
 
 /** 纵向渲染上下文 */
@@ -41,6 +52,8 @@ export interface VerticalRenderContext {
   sectionCache?: IEpubSectionCache;
   /** 资源缓存管理器 */
   resourceCache?: IEpubResourceCache;
+  /** 阅读顺序：用于跳过 EPUB3 导航文档等隐藏章节（缺省为恒等映射） */
+  readingOrder?: EpubReadingOrder;
 }
 
 /** 纵向渲染状态 */
@@ -117,9 +130,17 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
   // 观察器引用
   let sectionObserver: IntersectionObserver | null = null;
   let navigationHook: EpubNavigationHook | null = null;
+  /** 阅读顺序：隐藏章节不渲染、不参与滚动定位（缺省为恒等映射） */
+  const readingOrder: EpubReadingOrder = context.readingOrder ?? createEpubReadingOrder([]);
   const wrapperHeightRafIds = new Map<number, number[]>();
   const wrapperResizeObservers = new Map<number, ResizeObserver>();
   const wrapperImageCleanupFns = new Map<number, Array<() => void>>();
+  /** 固定版式章节管理器：流式书籍不产生任何监听与舞台 */
+  const createSectionManager = (): FixedLayoutSectionManager => createFixedLayoutSectionManager({
+    getContainer: () => state.scrollContainer,
+    getSectionWrapper: (index) => state.sectionContainers.get(index) ?? null,
+  });
+  let fixedLayoutManager = createSectionManager();
 
   /**
    * 设置导航 hook
@@ -355,8 +376,14 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
 
     if (scrollHeight > viewportHeight && scrollTop + viewportHeight >= scrollHeight - 50 && sectionCount > 0) {
       currentSectionIndex = sectionCount - 1;
+      // 末尾章节若是隐藏章节（如置于书末的导航文档），回退到前一个可见章节
+      if (!readingOrder.isVisible(currentSectionIndex)) {
+        currentSectionIndex = readingOrder.prevVisible(currentSectionIndex);
+      }
     } else {
       state.sectionContainers.forEach((wrapper, index) => {
+        // 隐藏章节（EPUB3 导航文档）不参与阅读进度计算
+        if (!readingOrder.isVisible(index)) return;
         const rect = wrapper.getBoundingClientRect();
         const containerRect = container.getBoundingClientRect();
         const relativeTop = rect.top - containerRect.top + scrollTop;
@@ -456,6 +483,11 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
    * 使用 renderingInProgress 防止并发渲染同一章节
    */
   const renderSection = async (index: number, options?: RenderOptions): Promise<void> => {
+    // 隐藏章节不渲染（保持索引稳定，只做不可见标记）
+    if (!readingOrder.isVisible(index)) {
+      return;
+    }
+
     // 幂等性检查：已渲染的章节跳过
     if (state.renderedSections.has(index)) {
       return;
@@ -494,7 +526,14 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
       }
 
       if (cacheEntry) {
+        // 固定版式书籍在 head 中声明逻辑视口尺寸；流式书籍返回 null，保持原渲染路径
+        const fixedViewport = isFixedLayoutEnabled()
+          ? parseFixedLayoutViewport(cacheEntry.rawHtml)
+          : null;
         try {
+          // 重新渲染前释放旧的固定版式舞台，避免残留节点
+          fixedLayoutManager.release(index);
+
           // 使用 shadow DOM 隔离样式（复用已存在的 Shadow Root 或创建新的）
           let shadow = wrapper.shadowRoot;
           clearWrapperHeightSync(index);
@@ -508,7 +547,9 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
           // 注入主题样式
           const style = document.createElement('style');
           style.setAttribute('data-epub-theme-style', '');
-          style.textContent = themeHook.getThemeStyles(options);
+          style.textContent = themeHook.getThemeStyles(options, {
+            fixedLayout: Boolean(fixedViewport),
+          });
           shadow.appendChild(style);
 
           // 注入原文档样式（占位符稍后统一替换）
@@ -567,6 +608,10 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
 
           // 注入经过占位符替换的原文档样式
           if (stylesText) {
+            // 归一化书籍 CSS：html/:root->:host、rem->em；固定版式保留书籍根字号作为 em 基准
+            stylesText = normalizeBookCssForShadow(stylesText, {
+              preserveRootFontSize: Boolean(fixedViewport),
+            });
             const originalStyleEl = document.createElement('style');
             originalStyleEl.textContent = stylesText;
             shadow.appendChild(originalStyleEl);
@@ -576,8 +621,25 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
           const content = document.createElement('div');
           content.className = 'epub-section-content';
           content.innerHTML = extractBodyContent(restoredHtml);
-          shadow.appendChild(content);
-          setupWrapperHeightSync(index, wrapper, content);
+
+          // 固定版式：书籍按逻辑像素写死页面，需要整体缩放到阅读器视口
+          let heightSyncTarget: HTMLElement | null = null;
+          if (fixedViewport) {
+            // 规范要求固定版式不注入阅读器外边距，取消章节容器内边距与最小高度
+            wrapper.style.padding = '0';
+            wrapper.style.minHeight = '0';
+            const handle = createFixedLayoutStage(content, fixedViewport);
+            fixedLayoutManager.register(index, handle);
+            shadow.appendChild(handle.host);
+            // 缩放后同步章节高度；固定页面高度不随内容变化，无需再挂 ResizeObserver
+            fixedLayoutManager.rescale(index);
+          } else {
+            shadow.appendChild(content);
+            heightSyncTarget = content;
+          }
+          if (heightSyncTarget) {
+            setupWrapperHeightSync(index, wrapper, heightSyncTarget);
+          }
 
           // 处理链接点击事件
           if (navigationHook) {
@@ -627,15 +689,15 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
               // 渲染当前章节
               renderSection(index, renderOptions).catch(() => { });
 
-              // 预加载相邻章节
-              const prevIndex = index - 1;
-              const nextIndex = index + 1;
+              // 预加载相邻可见章节
+              const prevIndex = readingOrder.prevVisible(index);
+              const nextIndex = readingOrder.nextVisible(index);
 
               if (prevIndex >= 0 && !state.renderedSections.has(prevIndex)) {
                 renderSection(prevIndex, renderOptions).catch(() => { });
               }
 
-              if (nextIndex < sectionCount && !state.renderedSections.has(nextIndex)) {
+              if (nextIndex >= 0 && nextIndex < sectionCount && !state.renderedSections.has(nextIndex)) {
                 renderSection(nextIndex, renderOptions).catch(() => { });
               }
             }
@@ -649,8 +711,9 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
       }
     );
 
-    // 观察所有章节容器
-    state.sectionContainers.forEach((wrapper) => {
+    // 观察所有可见章节容器（隐藏章节不参与懒加载）
+    state.sectionContainers.forEach((wrapper, index) => {
+      if (!readingOrder.isVisible(index)) return;
       sectionObserver!.observe(wrapper);
     });
   };
@@ -665,19 +728,19 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
     };
 
     // 渲染当前章节
-    if (!state.renderedSections.has(sectionIndex)) {
+    if (readingOrder.isVisible(sectionIndex) && !state.renderedSections.has(sectionIndex)) {
       renderSection(sectionIndex, renderOptions).catch(() => { });
     }
 
-    // 渲染前一章节
-    const prevIndex = sectionIndex - 1;
+    // 渲染前一可见章节
+    const prevIndex = readingOrder.prevVisible(sectionIndex);
     if (prevIndex >= 0 && !state.renderedSections.has(prevIndex)) {
       renderSection(prevIndex, renderOptions).catch(() => { });
     }
 
-    // 渲染后一章节
-    const nextIndex = sectionIndex + 1;
-    if (nextIndex < sectionCount && !state.renderedSections.has(nextIndex)) {
+    // 渲染后一可见章节
+    const nextIndex = readingOrder.nextVisible(sectionIndex);
+    if (nextIndex >= 0 && nextIndex < sectionCount && !state.renderedSections.has(nextIndex)) {
       renderSection(nextIndex, renderOptions).catch(() => { });
     }
   };
@@ -688,8 +751,12 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
    */
   const goToPage = async (page: number): Promise<void> => {
     // 提取整数页码和章节内偏移
-    const intPage = Math.floor(page);
-    const offsetRatio = page - intPage;
+    const requestedPage = Math.floor(page);
+
+    // 目标是隐藏章节时吸附到最近可见章节（偏移量随章节变化而丢弃）
+    const snappedPage = nearestVisiblePage(readingOrder, requestedPage);
+    const intPage = snappedPage;
+    const offsetRatio = snappedPage === requestedPage ? page - requestedPage : 0;
 
     if (intPage < 1 || intPage > sectionCount) return;
 
@@ -711,7 +778,7 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
       }
 
       state.currentPage = intPage;
-      state.currentPreciseProgress = page;
+      state.currentPreciseProgress = intPage + offsetRatio;
 
       setTimeout(() => {
         state.isNavigating = false;
@@ -720,7 +787,7 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
         ensureSectionsRendered(intPage - 1);
 
         if (context.onPageChange) {
-          context.onPageChange(page);
+          context.onPageChange(intPage + offsetRatio);
         }
 
         if (context.onFirstScreenReady) {
@@ -787,6 +854,9 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
     // 保存滚动容器引用
     state.scrollContainer = container;
 
+    // 容器重建前释放上一轮的固定版式舞台
+    fixedLayoutManager.releaseAll();
+
     // 清空容器
     container.innerHTML = '';
     container.style.cssText = `
@@ -814,6 +884,14 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
       const wrapper = document.createElement('div');
       wrapper.className = 'epub-section-wrapper';
       wrapper.dataset.sectionIndex = String(i);
+      // 隐藏章节（EPUB3 导航文档）不占位、不参与滚动定位，但保留索引稳定
+      if (!readingOrder.isVisible(i)) {
+        wrapper.dataset.hiddenSection = 'true';
+        wrapper.style.display = 'none';
+        container.appendChild(wrapper);
+        state.sectionContainers.set(i, wrapper);
+        continue;
+      }
       wrapper.style.cssText = `
         min-height: ${MIN_SECTION_HEIGHT}px;
         height: auto;
@@ -844,7 +922,13 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
     if (sectionCount > 0 && initialPageInt > sectionCount) {
       initialPageInt = sectionCount;
     }
+    // 初始位置落在隐藏章节（如旧进度停在被隐藏的导航页）时吸附到最近可见章节
+    const requestedInitialPage = initialPageInt;
+    initialPageInt = nearestVisiblePage(readingOrder, initialPageInt);
     let initialOffset = rawProgress - Math.floor(rawProgress);
+    if (initialPageInt !== requestedInitialPage) {
+      initialOffset = 0;
+    }
     if (!isFinite(initialOffset) || initialOffset < 0) initialOffset = 0;
     if (initialOffset >= 1) initialOffset = MAX_RATIO;
     if (initialOffset > MAX_RATIO) initialOffset = MAX_RATIO;
@@ -857,14 +941,26 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
     const currentIndex = initialPageInt - 1;
     let sectionsToRender = [
       currentIndex,
-      Math.max(0, currentIndex - 1),
-      Math.min(sectionCount - 1, currentIndex + 1),
-    ].filter((v, i, arr) => arr.indexOf(v) === i && v >= 0 && v < sectionCount);
+      readingOrder.prevVisible(currentIndex),
+      readingOrder.nextVisible(currentIndex),
+    ].filter(
+      (v, i, arr) =>
+        v >= 0 &&
+        v < sectionCount &&
+        readingOrder.isVisible(v) &&
+        arr.indexOf(v) === i,
+    );
 
     if (sectionsToRender.length === 0 && sectionCount > 0) {
-      sectionsToRender = [0];
-      state.currentPage = 1;
-      state.currentPreciseProgress = 1;
+      // 兜底：从头寻找首个可见章节，避免再次落到隐藏章节
+      let firstVisible = 0;
+      while (firstVisible < sectionCount && !readingOrder.isVisible(firstVisible)) {
+        firstVisible += 1;
+      }
+      if (firstVisible >= sectionCount) firstVisible = 0;
+      sectionsToRender = [firstVisible];
+      state.currentPage = firstVisible + 1;
+      state.currentPreciseProgress = firstVisible + 1;
     }
 
     // 优化：优先渲染当前章节，渲染完成后立即触发首屏回调
@@ -953,6 +1049,7 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
 
     state.verticalContinuousMode = false;
     clearAllWrapperHeightSync();
+    fixedLayoutManager.releaseAll();
     state.sectionContainers.clear();
     state.renderedSections.clear();
     state.renderingInProgress.clear();
@@ -987,6 +1084,9 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
     // 临时保存原有状态
     const originalSectionContainers = state.sectionContainers;
     const originalRenderedSections = state.renderedSections;
+    // 固定版式舞台按章节索引登记，预热期间需要隔离，避免覆盖真实渲染状态
+    const originalFixedLayoutManager = fixedLayoutManager;
+    fixedLayoutManager = createSectionManager();
 
     // 创建临时状态
     state.sectionContainers = new Map();
@@ -1014,9 +1114,10 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
         state.sectionContainers.set(index, wrapper);
       }
 
-      // 执行渲染（会自动写入缓存）
+      // 执行渲染（会自动写入缓存）：隐藏章节无需预热
       for (const index of indices) {
         if (!state.sectionContainers.has(index)) continue;
+        if (!readingOrder.isVisible(index)) continue;
 
         try {
           await renderSection(index, { theme: 'light' });
@@ -1028,6 +1129,9 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
       log(`[EPUB预热] 预热流程完成`).catch(() => { });
     } finally {
       indices.forEach((index) => clearWrapperHeightSync(index));
+      // 释放预热产生的固定版式舞台
+      fixedLayoutManager.releaseAll();
+      fixedLayoutManager = originalFixedLayoutManager;
       // 清理临时容器
       offscreenContainer.remove();
 
@@ -1038,16 +1142,19 @@ export function useVerticalRender(context: VerticalRenderContext): VerticalRende
   };
 
   const updateThemeStyles = (options?: RenderOptions) => {
-    const next = themeHook.getThemeStyles(options);
     for (const [index, wrapper] of state.sectionContainers.entries()) {
       const shadow = wrapper.shadowRoot;
       if (!shadow) continue;
       const styleEl =
         shadow.querySelector('style[data-epub-theme-style]') || shadow.querySelector('style');
       if (!styleEl) continue;
-      styleEl.textContent = next;
+      // 固定版式章节需要独立的主题样式集，避免覆盖书籍绝对尺寸
+      styleEl.textContent = themeHook.getThemeStyles(options, {
+        fixedLayout: fixedLayoutManager.has(index),
+      });
       const content = shadow.querySelector('.epub-section-content');
-      if (content instanceof HTMLElement) {
+      if (content instanceof HTMLElement && !fixedLayoutManager.has(index)) {
+        // 固定版式的高度由舞台缩放决定，不参与内容高度同步
         setupWrapperHeightSync(index, wrapper, content);
       }
     }

@@ -9,8 +9,19 @@ import type {
   TTSContentProvider,
 } from '../../../services/tts/providers/TTSContentProvider';
 import { log, logError, getReaderSettings, saveReaderSettings } from '../../../services';
-import { TTS_RATE_DEFAULT } from '../../../constants/tts';
+import { coverService } from '../../../services/cover';
+import { ensureNotificationPermission } from '../../../utils/notificationPermission';
+import { isAndroid } from '../../../utils/platform';
+import { TTS_CHARS_PER_SECOND_PRIORS, TTS_RATE_DEFAULT } from '../../../constants/tts';
 import { createTTSClient, type TTSFailReason } from './createTTSClient';
+
+/** 通知文案更新的最小间隔（毫秒）：避免逐句 notify 过于频繁 */
+const NOTIFICATION_TEXT_MIN_INTERVAL_MS = 2000;
+/** 通知正文最大长度：超出部分截断，避免系统截断位置不可控 */
+const NOTIFICATION_TEXT_MAX_LENGTH = 120;
+
+/** 非阻塞警告（由 Reader 层转成 toast） */
+export type TTSWarningKey = 'listenBackgroundServiceFailed';
 
 /** 操作锁状态 */
 type ToggleLock = 'idle' | 'stopping' | 'starting';
@@ -23,12 +34,22 @@ interface PlayResult {
   success: boolean;
   failReason?: TTSFailReason;
   action?: 'stop';
+  /** 通知权限被拒绝（仅提示用，不影响朗读） */
+  notificationPermissionDenied?: boolean;
 }
 
 interface UseTTSOptions {
   rendererRef: React.MutableRefObject<IBookRenderer | null>;
   listenSupported: boolean;
   onReadingActivity?: () => void;
+  /** 通知标题（书名），仅 Android 原生媒体通知使用 */
+  notificationTitle?: string;
+  /** 通知副标题（章节名） */
+  notificationSubtitle?: string;
+  /** 书籍 id，用于解析封面作为通知大图标 */
+  notificationBookId?: number;
+  /** 非阻塞警告回调（例如后台保活服务启动失败） */
+  onWarning?: (key: TTSWarningKey) => void;
 }
 
 interface UseTTSReturn {
@@ -37,6 +58,8 @@ interface UseTTSReturn {
   isActive: boolean;
   toggle: () => Promise<PlayResult | void>;
   stop: () => Promise<void>;
+  /** 先回写朗读位置再停止（供模式切换等场景保持进度连续） */
+  stopAndRestorePosition: () => Promise<void>;
   notifyDocumentUpdated: () => Promise<void>;
 }
 
@@ -55,6 +78,10 @@ export const useTTS = ({
   rendererRef,
   listenSupported,
   onReadingActivity,
+  notificationTitle,
+  notificationSubtitle,
+  notificationBookId,
+  onWarning,
 }: UseTTSOptions): UseTTSReturn => {
   const [state, setState] = useState<TTSState>('stopped');
   const sessionRef = useRef<TTSSession | null>(null);
@@ -63,7 +90,58 @@ export const useTTS = ({
   /** 启动过程中收到停止请求时置为 true，启动完成后自动 shutdown */
   const pendingStopRef = useRef(false);
 
+  // ---- 媒体通知相关状态（仅 Android native 模式使用） ----
+  const stateRef = useRef<TTSState>('stopped');
+  const notificationTitleRef = useRef(notificationTitle ?? '');
+  const notificationSubtitleRef = useRef(notificationSubtitle ?? '');
+  const notificationBookIdRef = useRef<number | undefined>(notificationBookId);
+  /** 当前朗读句文本（来自会话高亮 Range） */
+  const narrationTextRef = useRef('');
+  /** 章节进度（positionMs/durationMs），随会话 progress 更新 */
+  const playbackProgressRef = useRef<{
+    positionMs: number;
+    durationMs: number;
+    chapterTitle?: string;
+  }>({ positionMs: 0, durationMs: 0 });
+  /** 进度是否有新值：仅在变化时下发，避免文案更新把进度条拉回旧位置 */
+  const progressDirtyRef = useRef(true);
+  /** 封面路径（本地路径或 data URL），仅用于通知大图标 */
+  const coverPathRef = useRef<string | undefined>(undefined);
+  /** 封面是否需要随下一次通知更新一起下发 */
+  const coverDirtyRef = useRef(false);
+  const lastNotificationPushRef = useRef(0);
+  const notificationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onWarningRef = useRef(onWarning);
+  /** 当前语音的语速档案 key：引擎|语音|语言 */
+  const speedProfileKeyRef = useRef('');
+
   const isActive = state !== 'stopped';
+
+  useEffect(() => {
+    notificationTitleRef.current = notificationTitle ?? '';
+  }, [notificationTitle]);
+
+  useEffect(() => {
+    notificationSubtitleRef.current = notificationSubtitle ?? '';
+  }, [notificationSubtitle]);
+
+  useEffect(() => {
+    notificationBookIdRef.current = notificationBookId;
+  }, [notificationBookId]);
+
+  useEffect(() => {
+    onWarningRef.current = onWarning;
+  }, [onWarning]);
+
+  /** 清理通知节流定时器（卸载时） */
+  useEffect(() => {
+    return () => {
+      if (notificationTimerRef.current !== null) {
+        clearTimeout(notificationTimerRef.current);
+        notificationTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const releaseActiveTTS = useCallback(async (): Promise<void> => {
     const session = sessionRef.current;
@@ -71,14 +149,150 @@ export const useTTS = ({
     sessionRef.current = null;
     clientRef.current = null;
 
+    // 清理待发送的通知更新，避免停止后还向已释放的 client 推送
+    if (notificationTimerRef.current !== null) {
+      clearTimeout(notificationTimerRef.current);
+      notificationTimerRef.current = null;
+    }
+
     if (session) {
       await session.shutdown().catch(() => {});
     }
     if (client) {
       await client.shutdown().catch(() => {});
     }
+    stateRef.current = 'stopped';
     setState('stopped');
   }, []);
+
+  /** 组装通知正文：章节名 · 当前句（超长截断） */
+  const buildNotificationText = useCallback((): string | undefined => {
+    // 章节标题优先用 TTS progress 携带的 section 标题（跟随朗读章节），
+    // 阅读器当前页的 TOC 标题只作为初始兜底。
+    const subtitle = (playbackProgressRef.current.chapterTitle || notificationSubtitleRef.current).trim();
+    const sentence = narrationTextRef.current.trim();
+    const base = subtitle && sentence ? `${subtitle} · ${sentence}` : sentence || subtitle;
+    if (!base) return undefined;
+    return base.length > NOTIFICATION_TEXT_MAX_LENGTH
+      ? `${base.slice(0, NOTIFICATION_TEXT_MAX_LENGTH)}…`
+      : base;
+  }, []);
+
+  /** 把当前播放态/文案/封面推送到原生媒体通知（封面只随变更下发一次） */
+  const pushPlaybackState = useCallback((next: TTSState) => {
+    const client = clientRef.current;
+    if (!(client instanceof NativeTTSClient)) return;
+    const largeIconPath = coverDirtyRef.current ? coverPathRef.current : undefined;
+    coverDirtyRef.current = false;
+    const includeProgress = progressDirtyRef.current;
+    progressDirtyRef.current = false;
+    const skip = sessionRef.current?.getSkipAvailability();
+    void client.setPlaybackState(
+      next,
+      notificationTitleRef.current || undefined,
+      buildNotificationText(),
+      largeIconPath,
+      includeProgress ? Math.max(0, Math.round(playbackProgressRef.current.positionMs)) : undefined,
+      includeProgress ? Math.max(0, Math.round(playbackProgressRef.current.durationMs)) : undefined,
+      skip?.canSkipPrevious,
+      skip?.canSkipNext,
+    );
+  }, [buildNotificationText]);
+
+  /** 逐句更新做节流：最多每 2s 刷新一次通知，并在尾随补发最新句 */
+  const scheduleNotificationPush = useCallback(() => {
+    const now = Date.now();
+    const elapsed = now - lastNotificationPushRef.current;
+    if (elapsed >= NOTIFICATION_TEXT_MIN_INTERVAL_MS) {
+      lastNotificationPushRef.current = now;
+      pushPlaybackState(stateRef.current);
+      return;
+    }
+    if (notificationTimerRef.current !== null) return;
+    notificationTimerRef.current = setTimeout(() => {
+      notificationTimerRef.current = null;
+      lastNotificationPushRef.current = Date.now();
+      pushPlaybackState(stateRef.current);
+    }, NOTIFICATION_TEXT_MIN_INTERVAL_MS - elapsed);
+  }, [pushPlaybackState]);
+
+  /** 解析封面作为通知大图标（仅一次；失败不影响朗读） */
+  const resolveNotificationCover = useCallback(async () => {
+    const bookId = notificationBookIdRef.current;
+    if (bookId == null) return;
+    try {
+      const url = await coverService.getCoverUrl(bookId);
+      if (!url) return;
+      coverPathRef.current = url;
+      coverDirtyRef.current = true;
+      // 封面解好时补一次推送，不必等下一句
+      scheduleNotificationPush();
+    } catch (e) {
+      logError('[TTS] 解析封面失败', e);
+    }
+  }, [scheduleNotificationPush]);
+
+  /** 当前朗读句变化（来自会话高亮），用于媒体通知动态文案 */
+  const handleNarration = useCallback((text: string) => {
+    narrationTextRef.current = text;
+    if (stateRef.current !== 'playing') return;
+    scheduleNotificationPush();
+  }, [scheduleNotificationPush]);
+
+  /** 实测语速回写：按“引擎+语音+语言”持久化，供下次直接使用 */
+  const handleSpeedMeasured = useCallback((cpsAtRate1: number) => {
+    const key = speedProfileKeyRef.current;
+    if (!key || !Number.isFinite(cpsAtRate1) || cpsAtRate1 <= 0) return;
+    const settings = getReaderSettings();
+    const profiles = { ...(settings.ttsVoiceSpeedProfiles || {}) };
+    profiles[key] = {
+      cpsAtRate1: Math.round(cpsAtRate1 * 100) / 100,
+      updatedAt: Date.now(),
+    };
+    saveReaderSettings({ ttsVoiceSpeedProfiles: profiles });
+    log(`[TTS] 语速档案更新 key=${key} cpsAtRate1=${cpsAtRate1}`, 'info');
+  }, []);
+
+  /** 章节进度变化（用于媒体通知进度条/拖动） */
+  const handlePlaybackProgress = useCallback(
+    (progress: { positionMs: number; durationMs: number; chapterTitle?: string }) => {
+      playbackProgressRef.current = progress;
+      progressDirtyRef.current = true;
+      // 进度（尤其 seek 后）立即推送，避免系统进度条停在旧位置；
+      // 进度事件本身约每句一次，频率不高。
+      pushPlaybackState(stateRef.current);
+    },
+    [pushPlaybackState],
+  );
+
+  /**
+   * 会话状态变化：更新 React 状态，并同步到原生媒体通知（仅 native 插件模式）。
+   * 以会话状态为唯一数据源，Service 只负责渲染，避免通知按钮与实际朗读状态不一致。
+   */
+  const handleSessionState = useCallback((next: TTSState) => {
+    setState(next);
+    stateRef.current = next;
+    // 状态变化同步一次进度（暂停/恢复/停止时位置需要立即对齐）
+    progressDirtyRef.current = true;
+    // 状态变化立即推送（丢弃节流中的待发送，避免旧状态覆盖新状态）
+    if (notificationTimerRef.current !== null) {
+      clearTimeout(notificationTimerRef.current);
+      notificationTimerRef.current = null;
+    }
+    lastNotificationPushRef.current = Date.now();
+    pushPlaybackState(next);
+  }, [pushPlaybackState]);
+
+  // 通知权限刚被授予时重发一次状态：补上此前被系统丢弃的通知
+  useEffect(() => {
+    const handlePermissionResult = (event: Event) => {
+      const granted = (event as CustomEvent<{ granted?: boolean }>).detail?.granted;
+      if (!granted) return;
+      pushPlaybackState(stateRef.current);
+    };
+    window.addEventListener('notificationPermissionResult', handlePermissionResult);
+    return () => window.removeEventListener('notificationPermissionResult', handlePermissionResult);
+  }, [pushPlaybackState]);
 
   useEffect(() => {
     return () => {
@@ -125,6 +339,9 @@ export const useTTS = ({
     pendingStopRef.current = false;
     log('[TTS] toggle → 开启听书', 'info');
     try {
+      // 通知权限：Android 13+ 的前台服务通知依赖该权限；仅做“尽力申请”，
+      // 被拒绝时继续朗读，由上层给出非阻塞提示
+      const notificationPermissionGranted = await ensureNotificationPermission();
       let readerSettings = getReaderSettings();
       const { client, failReason } = await createTTSClient(readerSettings.ttsPreferredEngine);
 
@@ -141,7 +358,26 @@ export const useTTS = ({
       }
       clientRef.current = client;
 
+      let initialCharsPerSecond: number | undefined;
       if (client instanceof NativeTTSClient) {
+        // 组装语速档案 key，并读取历史实测值作为本轮初值
+        const engine = client.getInitInfo().defaultEngine || client.name;
+        const voiceId = client.getVoiceId() || 'default';
+        const voiceLang = client.getVoices().find((v) => v.id === voiceId)?.lang
+          || client.getPrimaryLang()
+          || 'default';
+        const speedKey = `${engine}|${voiceId}|${voiceLang}`;
+        speedProfileKeyRef.current = speedKey;
+        const profile = getReaderSettings().ttsVoiceSpeedProfiles?.[speedKey]?.cpsAtRate1;
+        // 没有历史实测值时，用语音语言先验（zh 4.5 / en 15 ...）作为种子
+        const langKey = (voiceLang || '').split('-')[0].toLowerCase();
+        initialCharsPerSecond = profile ?? TTS_CHARS_PER_SECOND_PRIORS[langKey];
+        // 新会话：重置逐句文案、进度与封面下发标记
+        narrationTextRef.current = '';
+        playbackProgressRef.current = { positionMs: 0, durationMs: 0, chapterTitle: undefined };
+        progressDirtyRef.current = true;
+        coverDirtyRef.current = false;
+        if (isAndroid()) void resolveNotificationCover();
         const info = client.getInitInfo();
         if (info.defaultEngine) {
           const prevEngine = readerSettings.ttsNativeDefaultEngine;
@@ -198,11 +434,18 @@ export const useTTS = ({
       const newSession = new TTSSession(
         provider,
         driver,
-        setState,
+        handleSessionState,
         onReadingActivity,
         () => {
           if (sessionRef.current !== newSession) return;
           void releaseActiveTTS();
+        },
+        {
+          onNarration: handleNarration,
+          onPlaybackProgress: handlePlaybackProgress,
+          onSpeedMeasured: handleSpeedMeasured,
+          // 后台保活失败不影响朗读，只提示用户“后台可能没有通知”
+          onBackgroundServiceError: () => onWarningRef.current?.('listenBackgroundServiceFailed'),
         },
       );
       sessionRef.current = newSession;
@@ -210,6 +453,7 @@ export const useTTS = ({
       const success = await newSession.start({
         rate: ttsRate,
         voiceId: effectiveVoiceId || undefined,
+        charsPerSecondAtRate1: initialCharsPerSecond,
       });
 
       if (pendingStopRef.current) {
@@ -222,7 +466,7 @@ export const useTTS = ({
         await releaseActiveTTS();
         return { success: false, failReason: 'listenFailedNoContent' };
       }
-      return { success: true };
+      return { success: true, notificationPermissionDenied: !notificationPermissionGranted };
     } catch (error) {
       const errMsg = error instanceof Error
         ? `${error.name}: ${error.message}`
@@ -234,10 +478,32 @@ export const useTTS = ({
       pendingStopRef.current = false;
       lockRef.current = 'idle';
     }
-  }, [listenSupported, rendererRef, onReadingActivity, releaseActiveTTS]);
+  }, [
+    listenSupported,
+    rendererRef,
+    onReadingActivity,
+    releaseActiveTTS,
+    handleSessionState,
+    handleNarration,
+    handlePlaybackProgress,
+    handleSpeedMeasured,
+    resolveNotificationCover,
+  ]);
 
   const stop = useCallback(async (): Promise<void> => {
     if (lockRef.current === 'starting' || sessionRef.current || clientRef.current) {
+      await toggle();
+    }
+  }, [toggle]);
+
+  /** 模式切换等场景：先把最后朗读位置写回阅读器，再停止会话 */
+  const stopAndRestorePosition = useCallback(async (): Promise<void> => {
+    if (lockRef.current === 'starting' || sessionRef.current || clientRef.current) {
+      try {
+        await sessionRef.current?.restoreReadingPosition();
+      } catch (e) {
+        logError('[TTS] restoreReadingPosition 失败', e);
+      }
       await toggle();
     }
   }, [toggle]);
@@ -253,6 +519,7 @@ export const useTTS = ({
     isActive,
     toggle,
     stop,
+    stopAndRestorePosition,
     notifyDocumentUpdated,
-  }), [state, isPlaying, isActive, toggle, stop, notifyDocumentUpdated]);
+  }), [state, isPlaying, isActive, toggle, stop, stopAndRestorePosition, notifyDocumentUpdated]);
 };

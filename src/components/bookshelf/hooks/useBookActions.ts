@@ -129,9 +129,14 @@ export const useBookActions = ({
         }
         await loadBooks();
       } else {
-        const ids = Array.from(selectedGroupIds);
-        for (const gid of ids) {
+        // 「全部」选项卡：分组与书架根目录未分组书籍混合选择，两类一并删除
+        const groupIds = Array.from(selectedGroupIds);
+        for (const gid of groupIds) {
           await groupService.deleteGroup(gid, !!actualDeleteLocal);
+        }
+        const bookIds = Array.from(selectedBookIds);
+        for (const bid of bookIds) {
+          await bookService.deleteBook(bid, !!actualDeleteLocal);
         }
         await Promise.all([loadGroups(), loadBooks()]);
       }

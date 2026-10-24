@@ -53,6 +53,14 @@
   --safe-area-inset-bottom: 0px;
   --safe-area-inset-left: 0px;
   --safe-area-inset-right: 0px;
+
+  /* 物理遮挡（挖孔/刘海）安全区：
+     Android 由原生按 displayCutout insets 注入覆盖；iOS 直接取标准 env()（刘海即硬件遮挡）。
+     与 --safe-area-inset-* 的区别：这一组只表示硬件遮挡，与系统栏是否显示无关，
+     因此沉浸模式下（状态栏隐藏、让位为 0）仍然生效 */
+  --display-cutout-inset-top: env(safe-area-inset-top, 0px);
+  --display-cutout-inset-left: env(safe-area-inset-left, 0px);
+  --display-cutout-inset-right: env(safe-area-inset-right, 0px);
 }
 
 /* 全局：移除页面默认外边距并隐藏窗口滚动条 */
@@ -260,6 +268,11 @@ button {
 /* Reader dynamic viewport height to avoid status bar overlap */
 .reader-fullheight {
   height: 100vh;
+  /* 阅读页视口的盒模型契约：高度按动态视口计算，且顶部状态栏让位
+     （.reader-viewport 的 padding-top）必须从视口高度内部扣除。
+     若用默认的 content-box，padding 会把盒子撑高一个状态栏高度，
+     整块阅读区（含横向分页的每一列）被下压，底部正文落到视口外被裁掉 */
+  box-sizing: border-box;
 }
 @supports (height: 100dvh) {
   .reader-fullheight {
@@ -272,9 +285,25 @@ button {
   }
 }
 
-/* Import page: hard reset bubble effects inside this scope */
-.import-page button,
-.import-page input {
+/* 阅读页视口：顶部与左右避让
+   - 顶部让位 = max(状态栏让位, 物理遮挡)：状态栏隐藏时让位为 0，但仍避开挖孔/刘海首行
+   - 左右让位 = 物理遮挡：横屏挖孔在左右短边时，避免压住行首/行尾
+   状态栏让位由 useReaderViewportInset 注入的 --reader-top-inset 驱动；
+   需与 .reader-fullheight 的 border-box 契约配套使用（让位从视口内部扣除，而不是撑高盒子） */
+.reader-viewport {
+  /* 兜底：不支持 max() 的老 WebView 只按状态栏让位 */
+  padding-top: var(--reader-top-inset, 0px);
+  padding-top: max(var(--reader-top-inset, 0px), var(--display-cutout-inset-top, 0px));
+  padding-left: var(--display-cutout-inset-left, 0px);
+  padding-right: var(--display-cutout-inset-right, 0px);
+}
+
+/* Import page: hard reset bubble effects inside this scope
+   （.wifi-copy-btn 除外：WiFi 传书的拷贝大按钮依赖自身 inline 实底样式；
+     .wifi-import-btn 除外：WiFi 传书的导入大按钮依赖自身 inline 实底样式；
+     .nas-btn / .nas-input 除外：NAS 获取页全部按钮与表单输入框依赖自身 inline 样式） */
+.import-page button:not(.wifi-copy-btn):not(.wifi-import-btn):not(.nas-btn),
+.import-page input:not(.nas-input) {
   box-shadow: none !important;
   border: none !important;
   border-radius: 0 !important;

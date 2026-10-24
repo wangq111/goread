@@ -1,6 +1,5 @@
 import React, { useEffect, useState, useRef } from "react";
 import { useTranslation } from 'react-i18next';
-import { getSafeAreaInsets } from "../utils/layout";
 
 interface GroupingDrawerProps {
   open: boolean;
@@ -103,7 +102,8 @@ const GroupingDrawer: React.FC<GroupingDrawerProps> = ({
           background: "#fff",
           borderTopLeftRadius: 20,
           borderTopRightRadius: 20,
-          padding: `14px 16px calc(14px + ${getSafeAreaInsets().bottom}) 16px`,
+          // 避让全局底部菜单栏（变量已含底部安全区高度）
+          padding: `14px 16px calc(14px + var(--goread-navbar-h)) 16px`,
           boxSizing: "border-box",
           display: "flex",
           flexDirection: "column",

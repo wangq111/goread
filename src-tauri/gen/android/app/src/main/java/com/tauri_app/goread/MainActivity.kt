@@ -3,6 +3,7 @@ package com.tauri_app.goread
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.graphics.Color
 import android.os.Build
@@ -25,8 +26,8 @@ class MainActivity : TauriActivity() {
   
   // Hold reference to the WebView for injecting safe area insets
   private var webViewRef: WebView? = null
-  private var currentTop = 0
-  private var currentBottom = 0
+  // 最近一次计算出的安全区 CSS 变量（变量名 -> CSS px），供 WebView 就绪后补注入
+  private var currentSafeAreaVars: Map<String, Int> = emptyMap()
   private var insetsReady = false
   
   // Store the initial status bar height (before any hide/show operations)
@@ -37,6 +38,9 @@ class MainActivity : TauriActivity() {
   // Status bar controller
   private var windowInsetsController: WindowInsetsControllerCompat? = null
   private var isStatusBarVisible = true  // Default to visible (only hide in Reader page)
+  // 状态栏图标明暗偏好：true = 深色图标（适用于浅色背景）
+  // 默认跟随系统深浅色（与主题 windowLightStatusBar 一致），阅读页会显式切换为浅色图标
+  private var useDarkStatusBarIcons = true
   
   // Volume key page turn control
   private var volumeKeyEnabled = false
@@ -84,6 +88,15 @@ class MainActivity : TauriActivity() {
     println("[Permission] MANAGE_EXTERNAL_STORAGE result: $granted")
     notifyPermissionResult(granted)
   }
+
+  // 通知权限（Android 13+ POST_NOTIFICATIONS）申请结果回调
+  // 结果统一转发给前端，由前端决定是否提示“后台朗读无通知”
+  private val notificationPermissionLauncher = registerForActivityResult(
+    ActivityResultContracts.RequestPermission()
+  ) { granted ->
+    println("[Permission] POST_NOTIFICATIONS result: $granted")
+    notifyNotificationPermissionResult(granted)
+  }
   
   override fun onCreate(savedInstanceState: Bundle?) {
     // Enable edge-to-edge with auto-adapting colors
@@ -119,6 +132,9 @@ class MainActivity : TauriActivity() {
     windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
     windowInsetsController?.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
     
+    // 初始化图标外观为系统默认（深浅色跟随系统），且与主题 windowLightStatusBar 保持一致
+    useDarkStatusBarIcons = !isSystemInNightMode()
+    
     // Expose status bar control functions to JavaScript
     webView.addJavascriptInterface(StatusBarBridge(), "StatusBarBridge")
     
@@ -127,6 +143,8 @@ class MainActivity : TauriActivity() {
     
     // 存储权限控制接口（供前端按需调用）
     webView.addJavascriptInterface(StoragePermissionBridge(), "StoragePermissionBridge")
+    // 通知权限控制接口（Android 13+ 前台服务通知依赖，供前端按需调用）
+    webView.addJavascriptInterface(NotificationPermissionBridge(), "NotificationPermissionBridge")
     // SAF 文件访问接口（目录选择、扫描与复制）
     webView.addJavascriptInterface(SafBridge(), "SafBridge")
     
@@ -136,6 +154,9 @@ class MainActivity : TauriActivity() {
     
     // Default show status bar (only hide when entering Reader page based on user settings)
     windowInsetsController?.show(WindowInsetsCompat.Type.statusBars())
+    
+    // 应用图标明暗外观（部分机型在设置主题属性后仍需运行时确认）
+    applyStatusBarIconAppearance()
     
     // Don't replace WebViewClient as it would break Tauri's RustWebViewClient
     // Instead, we'll inject CSS variables via WindowInsets listener and periodic refresh
@@ -148,14 +169,14 @@ class MainActivity : TauriActivity() {
       // Also inject with a small delay to ensure DOM is ready
       webView.postDelayed({
         if (insetsReady) {
-          injectSafeAreaInsets(currentTop, currentBottom)
+          injectSafeAreaInsets(currentSafeAreaVars)
         }
       }, 100)
       
       // And again after a longer delay for SPA navigation
       webView.postDelayed({
         if (insetsReady) {
-          injectSafeAreaInsets(currentTop, currentBottom)
+          injectSafeAreaInsets(currentSafeAreaVars)
         }
       }, 500)
       
@@ -338,11 +359,14 @@ class MainActivity : TauriActivity() {
     ViewCompat.setOnApplyWindowInsetsListener(decorView) { view, insets ->
       val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
       val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+      // 挖孔/刘海属于硬件遮挡：与系统栏是否显示无关，沉浸模式下依然存在，需要单独取值
+      val displayCutout = insets.getInsets(WindowInsetsCompat.Type.displayCutout())
       val density = resources.displayMetrics.density
       
       // Apply bottom padding to the root view so content sits above the navigation bar and IME
       // We keep top padding 0 because we WANT the status bar to overlap (translucent)
-      val bottomPadding = kotlin.math.max(systemBars.bottom, ime.bottom)
+      // 底部同时避开挖孔；DecorView 的 padding 会直接缩小 WebView，底部无需再注入安全区
+      val bottomPadding = maxOf(systemBars.bottom, ime.bottom, displayCutout.bottom)
       view.setPadding(0, 0, 0, bottomPadding)
 
       // Convert physical pixels to CSS/dp pixels
@@ -358,44 +382,73 @@ class MainActivity : TauriActivity() {
       
       // Use the initial captured height if status bar is hidden (topPxFromInsets would be 0)
       // This ensures TopBar always has correct padding regardless of status bar visibility
-      val topPx = if (initialStatusBarHeightCaptured && topPxFromInsets == 0) {
+      val statusBarTopPx = if (initialStatusBarHeightCaptured && topPxFromInsets == 0) {
         initialStatusBarHeight
       } else {
         topPxFromInsets
       }
       
+      // 部分 ROM 的挖孔下沿会低于状态栏高度，取较大者保证首行/工具栏不被遮挡
+      val cutoutTopPx = (displayCutout.top / density).toInt()
+      val topPx = maxOf(statusBarTopPx, cutoutTopPx)
+      val cutoutLeftPx = (displayCutout.left / density).toInt()
+      val cutoutRightPx = (displayCutout.right / density).toInt()
+      
       // Since we applied padding for the bottom bar, the safe area inset for bottom is effectively 0
       val bottomPx = 0 
 
       // Store current values
-      currentTop = topPx
-      currentBottom = bottomPx
+      currentSafeAreaVars = buildSafeAreaVars(topPx, bottomPx, cutoutTopPx, cutoutLeftPx, cutoutRightPx)
       insetsReady = true
       
       // Inject if WebView is available
       if (webViewRef != null) {
-        injectSafeAreaInsets(topPx, bottomPx)
+        injectSafeAreaInsets(currentSafeAreaVars)
       }
       
       insets
     }
   }
   
-  private fun injectSafeAreaInsets(top: Int, bottom: Int) {
+  /**
+   * 组装注入 WebView 的安全区 CSS 变量（CSS px）
+   * - --safe-area-inset-*：内容需要避让的系统安全区；顶部已取「状态栏高度」与「挖孔遮挡」的较大者
+   * - --display-cutout-inset-*：纯物理遮挡（挖孔/刘海），与系统栏可见性无关，
+   *   沉浸阅读（状态栏隐藏）时前端仍需据此让位
+   * 底部不注入：已在 DecorView 的 padding 中处理，避免重复让位
+   */
+  private fun buildSafeAreaVars(
+    top: Int,
+    bottom: Int,
+    cutoutTop: Int,
+    cutoutLeft: Int,
+    cutoutRight: Int,
+  ): LinkedHashMap<String, Int> = linkedMapOf(
+    "--safe-area-inset-top" to top,
+    "--safe-area-inset-bottom" to bottom,
+    "--safe-area-inset-left" to cutoutLeft,
+    "--safe-area-inset-right" to cutoutRight,
+    "--display-cutout-inset-top" to cutoutTop,
+    "--display-cutout-inset-left" to cutoutLeft,
+    "--display-cutout-inset-right" to cutoutRight,
+  )
+  
+  private fun injectSafeAreaInsets(vars: Map<String, Int>) {
+    if (vars.isEmpty()) return
     webViewRef?.post {
+      // 用同一份数据生成 JS：避免 CSS 变量与 window 对象两处写法不一致
+      val varsJs = vars.entries.joinToString(", ") { (name, value) -> "\"$name\": $value" }
       // This JS code sets CSS variables and also retries when DOM is ready
       val js = """
         (function() {
+          var vars = { $varsJs };
           function setSafeArea() {
-            if (document.documentElement) {
-              document.documentElement.style.setProperty('--safe-area-inset-top', '${top}px');
-              document.documentElement.style.setProperty('--safe-area-inset-bottom', '${bottom}px');
-              document.documentElement.style.setProperty('--safe-area-inset-left', '0px');
-              document.documentElement.style.setProperty('--safe-area-inset-right', '0px');
-              console.log('[SafeArea] Insets set: top=${top}px, bottom=${bottom}px');
-              return true;
-            }
-            return false;
+            if (!document.documentElement) return false;
+            Object.keys(vars).forEach(function (name) {
+              document.documentElement.style.setProperty(name, vars[name] + 'px');
+            });
+            console.log('[SafeArea] Insets set: ' + JSON.stringify(vars));
+            return true;
           }
           
           // Try to set immediately
@@ -405,7 +458,7 @@ class MainActivity : TauriActivity() {
           }
           
           // Also store in window for later access by JS
-          window.__SAFE_AREA_INSETS__ = { top: ${top}, bottom: ${bottom}, left: 0, right: 0 };
+          window.__SAFE_AREA_INSETS__ = vars;
         })();
       """.trimIndent()
       webViewRef?.evaluateJavascript(js, null)
@@ -419,6 +472,8 @@ class MainActivity : TauriActivity() {
       runOnUiThread {
         windowInsetsController?.show(WindowInsetsCompat.Type.statusBars())
         isStatusBarVisible = true
+        // 部分 ROM 在重新显示状态栏后会重置图标外观，这里重新应用一次
+        applyStatusBarIconAppearance()
         println("[StatusBar] Shown")
       }
     }
@@ -432,10 +487,48 @@ class MainActivity : TauriActivity() {
       }
     }
     
+    /**
+     * 设置状态栏图标明暗，与页面背景保持一致
+     * @param darkIcons true = 深色图标（浅色背景），false = 浅色图标（深色背景，如阅读页）
+     */
+    @android.webkit.JavascriptInterface
+    fun setAppearance(darkIcons: Boolean) {
+      runOnUiThread {
+        useDarkStatusBarIcons = darkIcons
+        applyStatusBarIconAppearance()
+        println("[StatusBar] Icon appearance darkIcons=$darkIcons")
+      }
+    }
+    
+    /**
+     * 恢复系统默认的图标外观（深浅色跟随系统）
+     * 离开阅读页时调用，保证非阅读页与更新前行为一致
+     */
+    @android.webkit.JavascriptInterface
+    fun resetAppearance() {
+      runOnUiThread {
+        useDarkStatusBarIcons = !isSystemInNightMode()
+        applyStatusBarIconAppearance()
+        println("[StatusBar] Icon appearance reset to system default")
+      }
+    }
+    
     @android.webkit.JavascriptInterface
     fun isVisible(): Boolean {
       return isStatusBarVisible
     }
+  }
+  
+  // 应用当前记录的图标明暗外观
+  private fun applyStatusBarIconAppearance() {
+    // isAppearanceLightStatusBars = true 表示状态栏使用浅色背景、深色图标
+    windowInsetsController?.isAppearanceLightStatusBars = useDarkStatusBarIcons
+  }
+  
+  // 当前系统是否处于深色模式（用于跟随系统默认的状态栏图标外观）
+  private fun isSystemInNightMode(): Boolean {
+    val uiMode = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
+    return uiMode == Configuration.UI_MODE_NIGHT_YES
   }
   
   // 音量键翻页控制接口
@@ -522,6 +615,34 @@ class MainActivity : TauriActivity() {
     }
   }
   
+  // 通知权限控制 Bridge（供前端按需调用）
+  inner class NotificationPermissionBridge {
+    @android.webkit.JavascriptInterface
+    fun hasPermission(): Boolean {
+      return checkNotificationPermissionInternal()
+    }
+
+    @android.webkit.JavascriptInterface
+    fun isSupported(): Boolean {
+      // Android 13 以下没有该运行时权限，通知默认可见
+      return Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+    }
+
+    @android.webkit.JavascriptInterface
+    fun requestPermission() {
+      runOnUiThread {
+        requestNotificationPermission()
+      }
+    }
+
+    @android.webkit.JavascriptInterface
+    fun openSettings() {
+      runOnUiThread {
+        openNotificationSettings()
+      }
+    }
+  }
+
   // 内部权限检查方法
   // 电子书阅读器需要访问文档文件（PDF/EPUB/TXT），不同 Android 版本的权限机制不同
   private fun checkStoragePermissionInternal(): Boolean {
@@ -552,6 +673,71 @@ class MainActivity : TauriActivity() {
     }
   }
   
+  // 检查通知权限：Android 13 以下恒为 true（无该运行时权限）
+  private fun checkNotificationPermissionInternal(): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
+    return ContextCompat.checkSelfPermission(
+      this,
+      Manifest.permission.POST_NOTIFICATIONS
+    ) == PackageManager.PERMISSION_GRANTED
+  }
+
+  // 请求通知权限：已授权或系统无需授权时直接回调成功，避免无意义的弹框
+  private fun requestNotificationPermission() {
+    if (checkNotificationPermissionInternal()) {
+      notifyNotificationPermissionResult(true)
+      return
+    }
+    try {
+      println("[Permission] Requesting POST_NOTIFICATIONS")
+      notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    } catch (e: Exception) {
+      // 权限未在清单声明或系统异常时 launch 会抛异常，回传失败而不是崩溃
+      println("[Permission] Request POST_NOTIFICATIONS failed: ${e.javaClass.simpleName} ${e.message ?: ""}")
+      notifyNotificationPermissionResult(false)
+    }
+  }
+
+  // 跳转应用通知设置页（用户已拒绝后只能由用户手动开启）
+  private fun openNotificationSettings() {
+    try {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+          putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        startActivity(intent)
+      } else {
+        // Android 8 以下没有应用通知设置页，退化为应用详情页
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+          data = Uri.parse("package:$packageName")
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        startActivity(intent)
+      }
+      println("[Permission] Opened notification settings")
+    } catch (e: Exception) {
+      println("[Permission] Open notification settings failed: ${e.javaClass.simpleName} ${e.message ?: ""}")
+    }
+  }
+
+  // 通知前端通知权限结果（同时派发 DOM 事件，便于页面级监听刷新状态）
+  private fun notifyNotificationPermissionResult(granted: Boolean) {
+    webViewRef?.post {
+      val js = """
+        (function() {
+          if (typeof window.__onNotificationPermissionResult__ === 'function') {
+            window.__onNotificationPermissionResult__($granted);
+          }
+          if (typeof CustomEvent !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('notificationPermissionResult', { detail: { granted: $granted } }));
+          }
+        })();
+      """.trimIndent()
+      webViewRef?.evaluateJavascript(js, null)
+    }
+  }
+
   // 通知前端权限结果
   private fun notifyPermissionResult(granted: Boolean) {
     webViewRef?.post {

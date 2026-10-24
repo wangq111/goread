@@ -56,6 +56,25 @@ pub struct SetMediaSessionActiveRequest {
     pub foreground_service_text: Option<String>,
 }
 
+/// 播放状态同步请求：状态由前端会话回写，Service 只负责渲染媒体通知
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPlaybackStateRequest {
+    /// playing / paused / stopped
+    pub state: Option<String>,
+    pub title: Option<String>,
+    pub text: Option<String>,
+    /// 封面路径（本地文件路径或 data URL），用于通知大图标
+    pub large_icon_path: Option<String>,
+    /// 章节内播放位置（ms），用于媒体通知进度条
+    pub position_ms: Option<i64>,
+    /// 章节预计时长（ms），用于媒体通知进度条
+    pub duration_ms: Option<i64>,
+    /// 当前章节是否存在上一章/下一章（通知按钮显隐）
+    pub can_skip_previous: Option<bool>,
+    pub can_skip_next: Option<bool>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetVoicesResponse {
@@ -81,6 +100,12 @@ pub struct TTSSessionSegment {
     pub chunk_index: i32,
     pub cursor: Option<String>,
     pub anchor: Option<TTSSessionAnchor>,
+    /// 所属章节的整章可朗读字符数（前端估算进度条总时长用）
+    #[serde(default)]
+    pub section_speakable_length: Option<u32>,
+    /// 所属章节的总 chunk 数（前端按文本比例推进进度条）
+    #[serde(default)]
+    pub section_chunk_count: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,6 +136,8 @@ pub struct TTSSessionSetEndOfBookRequest {
 pub struct TTSSessionStopRequest {
     #[serde(default = "default_emit_stopped_event")]
     pub emit_stopped_event: bool,
+    /// 是否同时停止前台服务；seek 重启会话时必须为 false
+    pub stop_service: Option<bool>,
 }
 
 const fn default_emit_stopped_event() -> bool {

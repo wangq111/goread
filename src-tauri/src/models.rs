@@ -22,6 +22,9 @@ pub struct Book {
     pub precise_progress: Option<f64>,
     pub hide_divider: Option<bool>,
     pub toc_sort: Option<i64>,
+    pub source: Option<String>,         // 书籍来源：None=本地导入，"nas"=网络书架缓存书
+    pub source_conn_id: Option<String>, // NAS 连接 id（source 为 "nas" 时有效）
+    pub source_path: Option<String>,    // NAS 远端文件路径（source 为 "nas" 时有效）
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -50,6 +53,8 @@ pub struct Bookmark {
     pub book_id: i64,
     pub page_number: u32,
     pub title: String,
+    #[serde(default)]
+    pub precise_progress: Option<f64>,
     pub created_at: Option<i64>,
 }
 

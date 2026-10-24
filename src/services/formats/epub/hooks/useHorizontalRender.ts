@@ -11,8 +11,19 @@ import {
 import { epubCacheService } from '../epubCacheService';
 import { EpubThemeHook } from './useEpubTheme';
 import { EpubResourceHook } from './useEpubResource';
-import { getTocHrefForSection, getSpineIndexForHref } from './tocMapping';
-import { extractBodyContent } from '../../../../utils/htmlUtils';
+import { getTocHrefForSection } from './tocMapping';
+import {
+  createEpubReadingOrder,
+  nearestVisiblePage,
+  nextVisiblePage,
+  prevVisiblePage,
+  type EpubReadingOrder,
+} from './readingOrder';
+import { extractBodyContent, normalizeBookCssForShadow } from '../../../../utils/htmlUtils';
+import { parseFixedLayoutViewport } from '../layout/viewportSpec';
+import { createFixedLayoutStage, isFixedLayoutEnabled, EPUB_FIXED_VIEWPORT_CLASS } from '../layout/fixedLayoutStage';
+import { createFixedLayoutSectionManager } from '../layout/fixedLayoutSectionManager';
+import { hasActiveSelectionIn } from '../../../../utils/selection';
 import { stabilizeScrollTop } from './scrollStabilizer';
 
 /** 横向渲染上下文 */
@@ -29,14 +40,26 @@ export interface HorizontalRenderContext {
   resourceCache?: IEpubResourceCache;
   onPageChange?: (page: number) => void;
   onTocChange?: (href: string) => void;
+  /** 阅读顺序：用于跳过 EPUB3 导航文档等隐藏章节（缺省为恒等映射） */
+  readingOrder?: EpubReadingOrder;
+  /** 章节内容渲染完成回调（用于接入链接点击处理） */
+  onSectionRendered?: (content: HTMLElement, sectionIndex: number) => void;
 }
 
 /** 横向渲染状态 */
 export interface HorizontalRenderState {
+  /** 对外页码与精确进度（可被 TTS 同步，不用于渲染判定） */
   currentPage: number;
   currentPreciseProgress: number;
   readingMode: 'horizontal' | 'vertical';
   container: HTMLElement | null;
+  /**
+   * 实际渲染在容器里的章节索引（0-based），-1 表示容器里没有内容。
+   * 只由 renderSection 成功后写入、destroy 时重置；
+   * 渲染判定与章节根查询必须以它为准，不能用外部可改写的 currentPage。
+   * （纵向模式对应 state.renderedSections）
+   */
+  renderedSectionIndex: number;
 }
 
 /** 横向渲染 Hook 返回接口 */
@@ -47,7 +70,6 @@ export interface HorizontalRenderHook {
   getInstantPreciseProgress: () => number;
   applyThemeUpdateAndRestoreAnchor: (options?: RenderOptions) => Promise<boolean>;
   goToPage: (page: number) => Promise<void>;
-  goToHref: (href: string) => Promise<void>;
   nextPage: () => Promise<void>;
   prevPage: () => Promise<void>;
   scrollBy: (deltaY: number) => void;
@@ -60,13 +82,38 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
     currentPreciseProgress: 1,
     readingMode: 'horizontal',
     container: null,
+    renderedSectionIndex: -1,
   };
 
   const MAX_RATIO = 0.999999;
+  /**
+   * 用户选中文字引起的自动滚动结束后，仍短暂跳过吸附的宽限时间。
+   * 浏览器展示选区的滚动在松手后可能还有尾帧，立刻吸附会与之争夺滚动位置。
+   */
+  const SELECTION_SNAP_GRACE_MS = 300;
+  /** 阅读顺序：隐藏章节不参与翻页（缺省为恒等映射） */
+  const readingOrder: EpubReadingOrder = context.readingOrder ?? createEpubReadingOrder([]);
   let lastRenderOptions: RenderOptions | undefined;
   let resizeObserver: ResizeObserver | null = null;
   let isSnapping = false;
   let isGestureActive = false;
+  /** 无选区时最近一次的滚动位置：作为选字钉住的基准（浏览器为展示选区滚动之前的位置） */
+  let lastScrollLeftWhenIdle = 0;
+  /** 选字期间钉住的滚动位置；null 表示当前未钉住 */
+  let selectionPinLeft: number | null = null;
+  /** 固定版式章节管理器：流式书籍不注册章节，也不创建额外监听 */
+  const fixedLayoutManager = createFixedLayoutSectionManager(
+    {
+      getContainer: () => state.container,
+      getSectionWrapper: () => null,
+    },
+    {
+      // 横向翻页整页垂直居中
+      applyOptions: { verticalAlign: 'center' },
+      // 横向已有容器 ResizeObserver，避免重复监听
+      observeContainer: false,
+    },
+  );
 
   /** 内容区 padding 两侧总和，与 useEpubTheme 中 .epub-section-content { padding: 16px } 对应 */
   const CONTENT_PADDING_X = 32;
@@ -95,6 +142,9 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
   const ensureScrollWidthAligned = (container: HTMLElement): void => {
     const shadow = container.shadowRoot;
     if (!shadow) return;
+
+    // 固定版式由舞台缩放控制尺寸，不做分栏对齐
+    if (shadow.querySelector(`.${EPUB_FIXED_VIEWPORT_CLASS}`)) return;
 
     const contentEl = shadow.querySelector('.epub-section-content') as HTMLElement | null;
     if (!contentEl) return;
@@ -132,11 +182,23 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
     } catch {
       container.scrollLeft = left;
     }
+    markIdleScrollPosition(container);
   };
 
   /** 翻屏步长，等于容器视口宽度（由布局约束保证 columnWidth + columnGap = clientWidth） */
   const getColumnStepPx = (container: HTMLElement): number => {
     return container.clientWidth;
+  };
+
+  /**
+   * 记录「无选区时的基准滚动位置」，并解除上一轮选字的钉住状态。
+   * 选字钉住（见 setupScrollListener）需要以“浏览器为展示选区滚动之前的位置”为基准，
+   * 因此所有程序化改定滚动位置的地方都要同步基准，避免钉到陈旧位置。
+   */
+  const markIdleScrollPosition = (container: HTMLElement | null): void => {
+    if (!container) return;
+    selectionPinLeft = null;
+    lastScrollLeftWhenIdle = container.scrollLeft;
   };
 
   const snapToNearest = (container: HTMLElement): number => {
@@ -159,6 +221,8 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
       }
     }
 
+    // 吸附后的位置即“已安定”的页边界，作为选字钉住基准（同时解除旧钉住）
+    markIdleScrollPosition(container);
     return targetLeft;
   };
 
@@ -175,6 +239,7 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
     } catch {
       container.scrollLeft = left;
     }
+    markIdleScrollPosition(container);
     return left;
   };
 
@@ -183,7 +248,12 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
     resizeObserver = new ResizeObserver(() => {
       if (!state.container) return;
       applyHorizontalLayoutVars(state.container, lastRenderOptions);
+      // 固定版式按新的容器尺寸重算缩放（流式书籍为空操作）
+      fixedLayoutManager.rescale(state.renderedSectionIndex);
       ensureScrollWidthAligned(state.container);
+      // 选中文字时，浏览器可能因选字工具栏/放大镜改变视口尺寸而触发本回调；
+      // 此时若回写滚动位置会同样与浏览器的选区滚动互相争夺，跳过本次位置还原
+      if (hasActiveSelectionIn(state.container)) return;
       const ratio = getRatioFromProgress(state.currentPreciseProgress);
       scrollToRatio(state.container, ratio, 'auto');
       snapToNearest(state.container);
@@ -196,6 +266,10 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
    */
   const setupScrollListener = (container: HTMLElement) => {
     let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
+    /** 最近一次因用户选中文字而跳过吸附的时刻 */
+    let lastSelectionScrollTs = 0;
+    // 初始化选字钉住的基准位置
+    lastScrollLeftWhenIdle = container.scrollLeft;
     if ((container as any)._scrollHandler) {
       try {
         container.removeEventListener('scroll', (container as any)._scrollHandler);
@@ -205,12 +279,40 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
     const handleScroll = () => {
       if (isSnapping) return;
       if (isGestureActive) return;
+
+      // 用户正在选中文字：浏览器会为展示选区（放大镜 / 选区手柄）而自动滚动容器。
+      // 这里立刻（instant）把容器钉回选字开始前的位置，使选字过程中页面像素级不动；
+      // 若不做钉住而只做“不吸附”，页面仍会被浏览器带着来回移动。
+      if (hasActiveSelectionIn(container)) {
+        if (selectionPinLeft === null) {
+          // 基准取“上一个滚动事件记录的位置”，即浏览器为展示选区滚动之前的位置
+          selectionPinLeft = lastScrollLeftWhenIdle;
+        }
+        lastSelectionScrollTs = Date.now();
+        // 容差 0.5px：避免浏览器对 scrollLeft 取整导致的反复写入
+        if (Math.abs(container.scrollLeft - selectionPinLeft) > 0.5) {
+          try {
+            container.scrollLeft = selectionPinLeft;
+          } catch { }
+        }
+        return;
+      }
+
+      // 无选区：解除钉住，并记录基准位置（通常等于页边界）
+      selectionPinLeft = null;
+      lastScrollLeftWhenIdle = container.scrollLeft;
+
       if (scrollTimeout) {
         clearTimeout(scrollTimeout);
       }
       scrollTimeout = setTimeout(() => {
         scrollTimeout = null;
         if (!container) return;
+        // 选中文字期间（或选区滚动刚结束的宽限期内）不做吸附与进度结算：
+        // 吸附会把浏览器为展示选区而滚动到的位置强行拉回页边界，
+        // 浏览器随即再次滚动展示选区，形成高频往复，表现为屏幕抖动。
+        if (hasActiveSelectionIn(container)) return;
+        if (Date.now() - lastSelectionScrollTs < SELECTION_SNAP_GRACE_MS) return;
         applyHorizontalLayoutVars(container, lastRenderOptions);
         const denom = getHorizontalDenom(container);
         if (denom <= 0) return;
@@ -279,6 +381,9 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
     const onTouchStart = (e: TouchEvent) => {
       if (e.touches.length !== 1) return;
       if (isInteractiveTarget(e.target)) return;
+      // 已存在文本选区时把手势交还给浏览器：此时的横向拖动多为拖拽选区手柄扩展选区，
+      // 若按翻页处理会 preventDefault 中断选字并翻页
+      if (hasActiveSelectionIn(container)) return;
       const t = e.touches[0];
       const x = t.clientX;
       if (x < 55 || x > window.innerWidth - 55) return;
@@ -298,6 +403,12 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
 
       if (!start.decided) {
         if (Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+        // 长按后浏览器已进入选字状态（本次手势尚未判定方向）：
+        // 放弃翻页手势，让浏览器继续扩展选区
+        if (hasActiveSelectionIn(container)) {
+          reset();
+          return;
+        }
         start.decided = true;
         start.horizontal = Math.abs(dx) > Math.abs(dy) * 1.2;
         if (!start.horizontal) {
@@ -429,6 +540,11 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
       }
     }
 
+    // 固定版式书籍按章节声明逻辑视口尺寸；流式书籍返回 null，保持原渲染路径
+    const fixedViewport = isFixedLayoutEnabled()
+      ? parseFixedLayoutViewport(cacheEntry.rawHtml)
+      : null;
+
     // 使用资源缓存恢复 Blob URL
     let restoredHtml = cacheEntry.rawHtml;
     try {
@@ -443,6 +559,8 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
     }
 
     // 构建 Shadow DOM，注入主题样式和原始样式
+    // 重新渲染前释放旧的固定版式舞台
+    fixedLayoutManager.release(sectionIndex);
     let shadow = container.shadowRoot;
     if (!shadow) {
       shadow = container.attachShadow({ mode: 'open' });
@@ -457,7 +575,7 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
       ...options,
       theme,
       readingMode: 'horizontal',
-    });
+    }, { fixedLayout: Boolean(fixedViewport) });
     shadow.appendChild(themeStyle);
 
     if (cacheEntry.rawStyles.length > 0) {
@@ -472,6 +590,10 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
           stylesText = stylesText.split(placeholder).join(blobUrl);
         }
       }
+      // 归一化书籍 CSS：html/:root->:host、rem->em；固定版式保留书籍根字号作为 em 基准
+      stylesText = normalizeBookCssForShadow(stylesText, {
+        preserveRootFontSize: Boolean(fixedViewport),
+      });
       const originalStyle = document.createElement('style');
       originalStyle.textContent = stylesText;
       shadow.appendChild(originalStyle);
@@ -480,7 +602,19 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
     const content = document.createElement('div');
     content.className = 'epub-section-content';
     content.innerHTML = extractBodyContent(restoredHtml);
-    shadow.appendChild(content);
+
+    // 固定版式：书籍按逻辑像素写死页面，需要整体缩放到阅读器视口
+    if (fixedViewport) {
+      const handle = createFixedLayoutStage(content, fixedViewport);
+      fixedLayoutManager.register(sectionIndex, handle);
+      shadow.appendChild(handle.host);
+      fixedLayoutManager.rescale(sectionIndex);
+    } else {
+      shadow.appendChild(content);
+    }
+
+    // 接入链接点击处理（章内锚点 / 跨章节跳转 / 外部链接）
+    context.onSectionRendered?.(content, sectionIndex);
 
     // 渲染完成后补齐 scrollWidth 对齐到翻屏步长整数倍
     requestAnimationFrame(() => {
@@ -490,6 +624,8 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
     // 更新当前页码和进度
     const page = sectionIndex + 1;
     state.currentPage = page;
+    // 容器里此刻真正渲染的是这个章节：渲染判定/章节根查询的唯一事实源
+    state.renderedSectionIndex = sectionIndex;
     const emitted = typeof progressToEmit === 'number' && isFinite(progressToEmit) && progressToEmit > 0
       ? progressToEmit
       : page;
@@ -518,6 +654,8 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
     state.readingMode = 'horizontal';
     state.container = container;
 
+    fixedLayoutManager.releaseAll();
+
     lastRenderOptions = options;
     applyHorizontalLayoutVars(container, options);
 
@@ -528,6 +666,8 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
 
     container.innerHTML = '';
     container.scrollLeft = 0;
+    // 容器刚被清空：清零实际渲染章节，强制随后的 renderSection 生效
+    state.renderedSectionIndex = -1;
     container.style.cssText = `
         width: 100%;
         height: 100%;
@@ -544,15 +684,25 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
       Math.max(1, targetPage),
       context.sectionCount > 0 ? context.sectionCount : context.totalPages || 1,
     );
+    // 初始页为隐藏章节（如旧进度停在被隐藏的导航页）时吸附到最近可见页
+    const snappedPage = nearestVisiblePage(readingOrder, clampedPage);
+    // 发生吸附时丢弃原精确进度，避免把隐藏页写回阅读进度
+    const progressToEmit =
+      snappedPage === clampedPage &&
+      typeof initialProgress === 'number' &&
+      isFinite(initialProgress) &&
+      initialProgress > 0
+        ? initialProgress
+        : undefined;
 
-    await renderSection(clampedPage - 1, container, {
+    await renderSection(snappedPage - 1, container, {
       ...options,
       theme,
-    }, typeof initialProgress === 'number' && isFinite(initialProgress) && initialProgress > 0 ? initialProgress : undefined);
+    }, progressToEmit);
 
-    // 如果有初始精确进度，恢复滚动位置
-    if (initialProgress && initialProgress > 0) {
-      const ratio = getRatioFromProgress(initialProgress);
+    // 如果有初始精确进度，恢复滚动位置（发生隐藏章节吸附时 progressToEmit 为空，跳过）
+    if (progressToEmit && progressToEmit > 0) {
+      const ratio = getRatioFromProgress(progressToEmit);
       if (ratio > 0) {
         requestAnimationFrame(() => {
           if (!container) return;
@@ -574,16 +724,24 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
     const shadow = container.shadowRoot;
     if (!shadow) return;
     const theme = options?.theme || context.currentTheme || 'light';
-    const next = context.themeHook.getThemeStyles({ ...options, theme, readingMode: 'horizontal' });
+    const next = context.themeHook.getThemeStyles(
+      { ...options, theme, readingMode: 'horizontal' },
+      { fixedLayout: fixedLayoutManager.has(state.renderedSectionIndex) },
+    );
     const styleEl =
       shadow.querySelector('style[data-epub-theme-style]') || shadow.querySelector('style');
     if (!styleEl) return;
     styleEl.textContent = next;
   };
 
+  /** 容器当前实际渲染的页码（1-based）；未渲染时退回对外页码 */
+  const getRenderedPage = (): number => {
+    return state.renderedSectionIndex >= 0 ? state.renderedSectionIndex + 1 : (state.currentPage || 1);
+  };
+
   const getInstantPreciseProgress = (): number => {
     const container = state.container;
-    const page = state.currentPage || 1;
+    const page = getRenderedPage();
     if (!container) return page;
     const denom = getHorizontalDenom(container);
     if (denom <= 0) return page;
@@ -598,11 +756,13 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
     if (!shadow) return false;
 
     const initialProgress = options?.initialVirtualPage;
+    // “就地更新样式”只对实际渲染中的章节成立：否则应交给 renderHorizontal 完整重渲染
+    const renderedPage = getRenderedPage();
     const targetPage =
       typeof initialProgress === 'number' && isFinite(initialProgress) && initialProgress > 0
         ? Math.floor(initialProgress)
-        : state.currentPage;
-    if (targetPage !== state.currentPage) return false;
+        : renderedPage;
+    if (targetPage !== renderedPage) return false;
 
     const hasThemeChange =
       options?.theme !== undefined ||
@@ -650,14 +810,21 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
 
   const goToPage = async (page: number): Promise<void> => {
     if (!state.container) return;
-    const intPage = Math.floor(page);
-    const ratio = clampRatio(page - intPage);
+    const requestedPage = Math.floor(page);
+
+    // 目标是隐藏章节时吸附到最近可见章节（偏移量随章节变化而丢弃）
+    const snappedPage = nearestVisiblePage(readingOrder, requestedPage);
+    const intPage = snappedPage;
+    const ratio = snappedPage === requestedPage ? clampRatio(page - requestedPage) : 0;
 
     if (intPage < 1 || intPage > (context.sectionCount || context.totalPages || 1)) {
       return;
     }
 
-    if (intPage !== state.currentPage || !state.container.shadowRoot) {
+    // 判据用「实际渲染章节」而不是 currentPage：currentPage 会被 TTS 的
+    // setSectionIndex 提前改写，用它判定会跳过渲染，导致视图停在旧章节。
+    // 注意单位：intPage 是 1-based 页码，renderedSectionIndex 是 0-based 章节索引
+    if (intPage - 1 !== state.renderedSectionIndex || !state.container.shadowRoot) {
       await renderSection(intPage - 1, state.container, {
         ...lastRenderOptions,
         theme: context.currentTheme,
@@ -675,16 +842,6 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
       state.currentPreciseProgress = precise;
       context.onPageChange?.(precise);
     });
-  };
-
-  const goToHref = async (href: string): Promise<void> => {
-    const sectionCount = context.sectionCount || 0;
-    if (sectionCount <= 0) return;
-
-    const sectionIndex = getSpineIndexForHref(href, context.spine);
-    if (sectionIndex >= 0 && sectionIndex < sectionCount) {
-      await goToPage(sectionIndex + 1);
-    }
   };
 
   const nextPage = async (): Promise<void> => {
@@ -707,8 +864,8 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
       }
     }
 
-    const next = state.currentPage + 1;
-    if (next > (context.sectionCount || context.totalPages || 1)) return;
+    const next = nextVisiblePage(readingOrder, state.currentPage);
+    if (next < 0 || next > (context.sectionCount || context.totalPages || 1)) return;
     await goToPage(next);
   };
 
@@ -732,7 +889,7 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
       }
     }
 
-    const prev = state.currentPage - 1;
+    const prev = prevVisiblePage(readingOrder, state.currentPage);
     if (prev < 1) return;
     await renderSection(prev - 1, container, {
       ...lastRenderOptions,
@@ -765,6 +922,9 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
   };
 
   const destroy = (): void => {
+    // 释放选字钉住状态，避免下次渲染沿用旧位置
+    selectionPinLeft = null;
+    fixedLayoutManager.releaseAll();
     if (resizeObserver) {
       try {
         resizeObserver.disconnect();
@@ -789,6 +949,8 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
       } catch { }
     }
     state.container = null;
+    // 容器内容已清空：实际渲染章节归零，下一次 goToPage 必然触发渲染
+    state.renderedSectionIndex = -1;
   };
 
   return {
@@ -798,7 +960,6 @@ export function useHorizontalRender(context: HorizontalRenderContext): Horizonta
     getInstantPreciseProgress,
     applyThemeUpdateAndRestoreAnchor,
     goToPage,
-    goToHref,
     nextPage,
     prevPage,
     scrollBy,

@@ -1,6 +1,7 @@
 import type { PageRange } from './useTxtRendererCore';
 import type { TxtChapterCacheHook } from './useTxtChapterCache';
 import type { TxtBookMeta } from '../txtCacheService';
+import { TXT_PROGRESS_MAX_DELTA } from '../constants';
 
 export type TxtChapterWindowOptions = {
   includePrev?: boolean;
@@ -28,6 +29,10 @@ export interface TxtChapterWindowJumpContext {
   renderFullContent: (container: HTMLElement) => Promise<void>;
   convertChapterPreciseToVirtualPrecise: (progress: number) => number;
   scrollToVirtualPage: (virtualPrecise: number, viewportHeight: number) => void;
+  /** 章节精确进度 → 全局字符偏移（窗口恢复精确定位） */
+  getCharOffsetFromProgress?: (progress: number) => number;
+  /** 字符偏移 → 当前模式视图定位 */
+  scrollToCharOffset?: (charOffset: number) => Promise<void>;
   preloadAdjacentChapters: (chapterIndex: number) => Promise<void>;
   jumpToPreciseProgress: (progress: number) => Promise<void>;
 }
@@ -64,7 +69,7 @@ export function useTxtChapterWindowJump(ctx: TxtChapterWindowJumpContext): TxtCh
     }
 
     const chapterCount = Math.max(1, bookMeta.chapters.length);
-    const max = chapterCount + 0.999999;
+    const max = chapterCount + TXT_PROGRESS_MAX_DELTA;
     const clampedProgress = Math.max(1, Math.min(progress, max));
 
     let chapterInt = Math.floor(clampedProgress);
@@ -135,8 +140,14 @@ export function useTxtChapterWindowJump(ctx: TxtChapterWindowJumpContext): TxtCh
 
     const viewportHeight = container.clientHeight;
     if (viewportHeight > 0) {
-      const virtualPrecise = ctx.convertChapterPreciseToVirtualPrecise(clampedProgress);
-      ctx.scrollToVirtualPage(virtualPrecise, viewportHeight);
+      // 字符偏移精确定位（窗口已渲染，段落标注就绪）；无标注能力时回退虚拟页
+      if (ctx.getCharOffsetFromProgress && ctx.scrollToCharOffset) {
+        const charOffset = ctx.getCharOffsetFromProgress(clampedProgress);
+        await ctx.scrollToCharOffset(charOffset);
+      } else {
+        const virtualPrecise = ctx.convertChapterPreciseToVirtualPrecise(clampedProgress);
+        ctx.scrollToVirtualPage(virtualPrecise, viewportHeight);
+      }
     }
 
     ctx.preloadAdjacentChapters(targetChapterIndex).catch(() => {});

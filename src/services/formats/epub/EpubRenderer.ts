@@ -173,6 +173,8 @@ export class EpubRenderer implements IBookRenderer {
       get bookId() { return lifeState.bookId || undefined; },
       sectionCache: this._sectionCache || undefined,
       resourceCache: this._resourceCache || undefined,
+      // 阅读顺序（隐藏 EPUB3 导航文档等章节，章节索引保持稳定）
+      get readingOrder() { return lifeState.readingOrder; },
       // 懒加载回调（兼容旧接口，当前实现已不依赖前端解析）
       ensureBookLoaded: () => ensureBookLoaded(),
     };
@@ -202,14 +204,21 @@ export class EpubRenderer implements IBookRenderer {
       onTocChange: (href: string) => {
         if (this.onTocChange) this.onTocChange(href);
       },
+      // 阅读顺序（隐藏 EPUB3 导航文档等章节，章节索引保持稳定）
+      get readingOrder() { return lifeState.readingOrder; },
+      // 章节内容渲染完成后接入链接点击处理
+      onSectionRendered: (content: HTMLElement, sectionIndex: number) => {
+        this._navigationHook?.setupLinkHandlers(content, sectionIndex);
+      },
     };
     this._horizontalRenderHook = useHorizontalRender(horizontalContext);
 
     // 导航 hook
     const navigationContext = {
-      getScrollContainer: () => this._verticalRenderHook?.state.scrollContainer ?? null,
-      sectionContainers: this._verticalRenderHook!.state.sectionContainers,
-      goToPage: (page: number) => this._verticalRenderHook!.goToPage(page),
+      getSectionRoot: (sectionIndex: number) => this.getRenderedSectionShadowRoot(sectionIndex),
+      getScrollContainer: () => this.getScrollContainer(),
+      getScrollAxis: (): 'x' | 'y' => (this._readingMode === 'horizontal' ? 'x' : 'y'),
+      goToPage: (page: number) => this.goToPage(page),
       get toc() { return lifeState.toc; },
       get spine() { return lifeState.spine; },
       get sectionCount() { return lifeState.sectionCount; },
@@ -403,23 +412,25 @@ export class EpubRenderer implements IBookRenderer {
 
   /**
    * 跳转到目录项（href）
+   * 支持「章节 + 章内锚点」形式：先跳到对应章节，再定位锚点
    */
   async goToHref(href: string): Promise<void> {
-    if (this._readingMode === 'vertical' && this._verticalRenderHook?.state.verticalContinuousMode) {
-      const lifeState = this._lifecycleHook.state;
-      const sectionCount = lifeState.sectionCount || 0;
-      const sectionIndex = getSpineIndexForHref(href, lifeState.spine);
+    const lifeState = this._lifecycleHook.state;
+    const sectionCount = lifeState.sectionCount || 0;
+    if (sectionCount <= 0) return;
 
-      if (sectionIndex >= 0 && sectionIndex < sectionCount) {
-        await this.goToPage(sectionIndex + 1);
-        return;
-      }
-    }
+    const sectionIndex = getSpineIndexForHref(href, lifeState.spine);
+    if (sectionIndex < 0 || sectionIndex >= sectionCount) return;
 
-    // Horizontal
-    if (this._horizontalRenderHook) {
-      await this._horizontalRenderHook.goToHref(href);
-    }
+    await this.goToPage(sectionIndex + 1);
+
+    const hashIndex = href.indexOf('#');
+    if (hashIndex < 0) return;
+    const anchor = href.slice(hashIndex + 1);
+    if (!anchor) return;
+
+    // 目标节点可能尚未渲染完成，交由导航 hook 重试定位
+    this._navigationHook?.scrollToAnchorWithRetry(anchor, sectionIndex);
   }
 
   /**
@@ -427,8 +438,11 @@ export class EpubRenderer implements IBookRenderer {
    */
   async nextPage(): Promise<void> {
     if (this._readingMode === 'vertical' && this._verticalRenderHook?.state.verticalContinuousMode) {
-      const nextPage = Math.min(this.getCurrentPage() + 1, this.getPageCount());
-      await this.goToPage(nextPage);
+      const nextIndex = this._lifecycleHook.state.readingOrder.nextVisible(
+        this.getCurrentSectionIndex(),
+      );
+      if (nextIndex < 0 || nextIndex + 1 > this.getPageCount()) return;
+      await this.goToPage(nextIndex + 1);
       return;
     }
 
@@ -442,8 +456,11 @@ export class EpubRenderer implements IBookRenderer {
    */
   async prevPage(): Promise<void> {
     if (this._readingMode === 'vertical' && this._verticalRenderHook?.state.verticalContinuousMode) {
-      const prevPage = Math.max(this.getCurrentPage() - 1, 1);
-      await this.goToPage(prevPage);
+      const prevIndex = this._lifecycleHook.state.readingOrder.prevVisible(
+        this.getCurrentSectionIndex(),
+      );
+      if (prevIndex < 0) return;
+      await this.goToPage(prevIndex + 1);
       return;
     }
 
@@ -491,10 +508,25 @@ export class EpubRenderer implements IBookRenderer {
    * 获取滚动容器
    */
   getScrollContainer(): HTMLElement | null {
-    if (this._readingMode === 'vertical') {
-      return this._currentContainer;
-    }
     return this._currentContainer;
+  }
+
+  /**
+   * 取指定章节的 shadow root（只返回「确实是该章节」的根）
+   * 纵向模式为对应章节容器（多章节同时渲染）；横向模式只渲染当前章节，
+   * 因此必须用「实际渲染章节」判定，不能用会被 TTS 提前改写的 currentPage。
+   * 锚点定位（导航）与 TTS 定位共用本方法，是章节根匹配的唯一判据。
+   */
+  private getRenderedSectionShadowRoot(sectionIndex: number): ShadowRoot | null {
+    if (this._readingMode === 'vertical') {
+      const wrapper = this._verticalRenderHook?.state.sectionContainers.get(sectionIndex);
+      return wrapper?.shadowRoot ?? null;
+    }
+    if (this._readingMode === 'horizontal') {
+      if (sectionIndex !== this._horizontalRenderHook?.state.renderedSectionIndex) return null;
+      return this._currentContainer?.shadowRoot ?? null;
+    }
+    return null;
   }
 
   /**
@@ -679,8 +711,11 @@ export class EpubRenderer implements IBookRenderer {
       getFilePath: () => this._lifecycleHook.state.filePath,
       getTotalSections: () => this.getSectionCount(),
       getCurrentSectionIndex: () => this.getCurrentSectionIndex(),
+      getHiddenSections: () => this._lifecycleHook.state.hiddenSections,
+      getSectionTitle: (idx) => this.getTTSSectionTitleByIndex(idx),
       getCurrentSectionRoot: () => this.getCurrentTTSSectionRoot(),
       getSectionRootByIndex: (idx) => this.getTTSSectionRootByIndex(idx),
+      isSectionRendered: (idx) => this.getRenderedSectionShadowRoot(idx) != null,
       getVisibleStartPosition: () => this.getVisibleStartPositionForTTS(),
       goToProgress: (progress) => this.goToPage(progress),
       setSectionIndex: (idx) => this.setCurrentSectionIndexForTTS(idx),
@@ -737,14 +772,33 @@ export class EpubRenderer implements IBookRenderer {
     return null;
   }
 
-  private getTTSSectionRootByIndex(sectionIndex: number): Element | null {
-    if (this._readingMode === 'vertical' && this._verticalRenderHook) {
-      const wrapper = this._verticalRenderHook.state.sectionContainers.get(sectionIndex);
-      const shadow = wrapper?.shadowRoot;
-      const content = shadow?.querySelector('.epub-section-content');
-      return (content as Element | null) ?? null;
+  /** 按 spine 索引从 TOC 取章节标题（同一章节有多个锚点时取第一个） */
+  private getTTSSectionTitleByIndex(sectionIndex: number): string | null {
+    const { toc, spine } = this._lifecycleHook.state;
+    if (!toc?.length || !spine?.length) return null;
+    const stack: TocItem[] = [...toc];
+    while (stack.length > 0) {
+      const item = stack.shift()!;
+      if (item.location != null) {
+        const idx = getSpineIndexForHref(String(item.location), spine);
+        if (idx === sectionIndex) {
+          const title = item.title?.trim();
+          if (title) return title;
+        }
+      }
+      if (item.children?.length) stack.push(...item.children);
     }
-    return this.getCurrentTTSSectionRoot();
+    return null;
+  }
+
+  /**
+   * TTS 用：按索引取章节内容根（.epub-section-content）
+   * 章节索引与实际渲染章节不一致时返回 null，交由上层先恢复章节再定位，
+   * 避免拿当前章节的 DOM 去搜另一章的 anchor（会误命中或误清高亮）。
+   */
+  private getTTSSectionRootByIndex(sectionIndex: number): Element | null {
+    const shadow = this.getRenderedSectionShadowRoot(sectionIndex);
+    return (shadow?.querySelector('.epub-section-content') as Element | null) ?? null;
   }
 }
 

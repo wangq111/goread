@@ -1,4 +1,5 @@
 import { loadTauriCore } from '../core/tauriCore';
+import { logError } from '../../commonService';
 import type { TTSReadingAnchor, TTSSegment } from '../types';
 import type { BackendTTSRequest } from './TTSContentProvider';
 
@@ -25,6 +26,8 @@ type RawSegment = {
   chunkIndex: number;
   cursor: string;
   anchor?: RawAnchor | null;
+  sectionSpeakableLength?: number;
+  sectionChunkCount?: number;
 };
 
 type RawResponse = {
@@ -47,6 +50,24 @@ export const invokeTTSGetSegments = async (
     cursor: raw.cursor ?? null,
     hasMore: raw.hasMore,
   };
+};
+
+
+/**
+ * 安全拉取后端 segments：失败时记录日志并返回空批次。
+ *
+ * EPUB/MOBI provider 的取片入口完全一致，集中在这里避免各写一份 try/catch。
+ */
+export const fetchBackendSegmentsSafe = async (
+  request: BackendTTSRequest,
+  logLabel: string,
+): Promise<BackendTTSResponse> => {
+  try {
+    return await invokeTTSGetSegments(request);
+  } catch (e) {
+    logError(`[TTS][${logLabel}] tts_get_segments 失败`, e);
+    return { segments: [], cursor: null, hasMore: false };
+  }
 };
 
 export const invokeTTSManagedSessionStart = async (payload: {
@@ -110,6 +131,8 @@ const toSegment = (raw: RawSegment): TTSSegment => ({
   chunkIndex: raw.chunkIndex,
   cursor: raw.cursor,
   anchor: toAnchor(raw.anchor ?? null),
+  sectionSpeakableLength: raw.sectionSpeakableLength,
+  sectionChunkCount: raw.sectionChunkCount,
 });
 
 /** 把 Rust 端原始 anchor 转成前端 TTSReadingAnchor */

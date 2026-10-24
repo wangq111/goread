@@ -1,4 +1,4 @@
-import type { BookFormat } from '../../formats/types';
+import type { BookFormat, TocItem } from '../../formats/types';
 import type { TTSReadingAnchor } from '../types';
 import type {
   TTSContentProvider,
@@ -8,8 +8,14 @@ import type {
   TTSReadingPosition,
 } from './TTSContentProvider';
 import { AnchorLocator } from './AnchorLocator';
-import { invokeTTSGetSegments } from './backendBridge';
-import { log, logError } from '../../index';
+import { fetchBackendSegmentsSafe } from './backendBridge';
+import { resolveProviderStartPosition } from './TTSContentProvider';
+import {
+  buildAnchorAtTextRatio,
+  findAnchorTextOffset,
+  getSpeakableLength,
+} from '../../../utils/ttsAnchor';
+import { log } from '../../index';
 
 /** MOBI Provider 上下文 */
 export interface MobiContentProviderContext {
@@ -19,6 +25,8 @@ export interface MobiContentProviderContext {
   getFilePath: () => string | null;
   /** 章节总数 */
   getSectionCount: () => number;
+  /** 目录（location 形如 section:<index>），用于媒体通知章节标题 */
+  getToc: () => TocItem[];
   /** 当前 ShadowRoot，包含所有 .mobi-section 节点 */
   getShadowRoot: () => ShadowRoot | null;
   /** 滚动容器，回前台时定位高亮用 */
@@ -47,17 +55,7 @@ export class MobiContentProvider implements TTSContentProvider {
   ): Promise<TTSContentProviderBatch> {
     const request = this.buildBackendRequest(req);
     if (!request) return { segments: [], cursor: null, hasMore: false };
-    try {
-      const batch = await invokeTTSGetSegments(request);
-      return {
-        segments: batch.segments,
-        cursor: batch.cursor,
-        hasMore: batch.hasMore,
-      };
-    } catch (e) {
-      logError('[TTS][MobiProvider] tts_get_segments 失败', e);
-      return { segments: [], cursor: null, hasMore: false };
-    }
+    return fetchBackendSegmentsSafe(request, 'MobiProvider');
   }
 
   buildBackendRequest(
@@ -73,7 +71,7 @@ export class MobiContentProvider implements TTSContentProvider {
       );
       return null;
     }
-    const start = this.#resolveStartPosition(req);
+    const start = resolveProviderStartPosition(req, this.#ctx.getVisibleStartPosition);
     const fallback = start?.sectionIndex ?? this.#findVisibleSectionIndex();
     return {
       bookId,
@@ -108,14 +106,61 @@ export class MobiContentProvider implements TTSContentProvider {
     this.#anchorLocator.invalidate();
   }
 
-  /** cursor=null 时优先用调用方传入的 startPosition，否则用 ctx 提供的视口起点 */
-  #resolveStartPosition(
-    req: TTSContentProviderGetSegmentsRequest,
-  ): TTSReadingPosition | null {
-    if (req.cursor) return null;
-    if (req.startPosition) return req.startPosition;
-    return this.#ctx.getVisibleStartPosition?.() ?? null;
+  /** 章节文本长度（用于媒体通知的章节时长估算） */
+  getSectionTextLength(sectionIndex: number): number | null {
+    const section = this.#getSections()[sectionIndex];
+    const length = section?.textContent?.length ?? 0;
+    return length > 0 ? length : null;
   }
+
+  /** 把章节内比例换算成可朗读起点（进度条拖动） */
+  buildAnchorAtRatio(sectionIndex: number, ratio: number): TTSReadingAnchor | null {
+    const text = this.#getSections()[sectionIndex]?.textContent;
+    return text ? buildAnchorAtTextRatio(text, ratio) : null;
+  }
+
+  /** 章节内可朗读字符数（去空白） */
+  getSectionSpeakableLength(sectionIndex: number): number | null {
+    const text = this.#getSections()[sectionIndex]?.textContent;
+    if (!text) return null;
+    const length = getSpeakableLength(text);
+    return length > 0 ? length : null;
+  }
+
+  /** 章节标题（媒体通知随朗读章节更新） */
+  getSectionTitle(sectionIndex: number): string | null {
+    const stack: TocItem[] = [...this.#ctx.getToc()];
+    while (stack.length > 0) {
+      const item = stack.shift()!;
+      const match = /^section:(\d+)/.exec(String(item.location ?? ''));
+      if (match && Number(match[1]) === sectionIndex) {
+        const title = item.title?.trim();
+        if (title) return title;
+      }
+      if (item.children?.length) stack.push(...item.children);
+    }
+    return null;
+  }
+
+  /** 相邻章节（MOBI sections 连续） */
+  getAdjacentSectionIndex(current: number, direction: 'prev' | 'next'): number | null {
+    if (current < 0) return null;
+    const count = this.#ctx.getSectionCount();
+    if (count <= 0) return null;
+    const next = current + (direction === 'next' ? 1 : -1);
+    return next >= 0 && next < count ? next : null;
+  }
+
+  /** 起播 anchor 在章节内的近似字符偏移（初始化进度条基准） */
+  getAnchorTextOffset(
+    sectionIndex: number,
+    anchor: TTSReadingAnchor | null | undefined,
+  ): number | null {
+    const text = this.#getSections()[sectionIndex]?.textContent;
+    return findAnchorTextOffset(text, anchor);
+  }
+
+  
 
   #getSections(): HTMLElement[] {
     const shadow = this.#ctx.getShadowRoot();

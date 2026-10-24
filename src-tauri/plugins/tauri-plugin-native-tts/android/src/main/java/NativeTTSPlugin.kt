@@ -14,9 +14,9 @@ import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
-import androidx.core.content.ContextCompat
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 @InvokeArg
@@ -45,6 +45,23 @@ class SetMediaSessionActiveArgs {
 }
 
 @InvokeArg
+class SetPlaybackStateArgs {
+  /** playing / paused / stopped */
+  var state: String? = null
+  var title: String? = null
+  var text: String? = null
+  /** 封面路径（本地文件路径或 data URL），用于通知大图标 */
+  var largeIconPath: String? = null
+  /** 章节内播放位置（ms），用于媒体通知进度条 */
+  var positionMs: Long? = null
+  /** 章节预计时长（ms），用于媒体通知进度条 */
+  var durationMs: Long? = null
+  /** 当前章节是否存在上一章/下一章（通知按钮显隐） */
+  var canSkipPrevious: Boolean? = null
+  var canSkipNext: Boolean? = null
+}
+
+@InvokeArg
 class TTSSessionAnchorArgs {
   var quote: String? = null
   var prefix: String? = null
@@ -60,6 +77,10 @@ class TTSSessionSegmentArgs {
   var chunkIndex: Int? = null
   var cursor: String? = null
   var anchor: TTSSessionAnchorArgs? = null
+  /** 所属章节整章可朗读字符数（用于前端估算章节总时长） */
+  var sectionSpeakableLength: Int? = null
+  /** 所属章节总 chunk 数（用于前端按文本比例推进进度条） */
+  var sectionChunkCount: Int? = null
 }
 
 @InvokeArg
@@ -84,6 +105,8 @@ class TTSSessionSetEndOfBookArgs {
 @InvokeArg
 class TTSSessionStopArgs {
   var emitStoppedEvent: Boolean? = true
+  /** 是否同时停止前台服务；seek 重启会话时传 false */
+  var stopService: Boolean? = null
 }
 
 @TauriPlugin
@@ -96,6 +119,30 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
   private val currentRate = AtomicReference(1.0f)
   private val currentVoiceId = AtomicReference("")
   private var textToSpeech: TextToSpeech? = null
+
+  /**
+   * TTS 实例代次：每次创建/销毁 textToSpeech 时递增。
+   * 语音列表等与引擎实例强绑定的缓存以代次为 key，实例重建后自动失效。
+   */
+  private val ttsGeneration = AtomicInteger(0)
+
+  /** 已实际应用到 TTS 引擎的音频配置标识（voice:xxx / lang:xxx），null 表示尚未应用 */
+  @Volatile
+  private var appliedVoiceKey: String? = null
+
+  /** 当前会话语言（session_start 下发），句段自身不带 lang 时用它兜底应用语言 */
+  @Volatile
+  private var sessionLang: String? = null
+
+  /** 语音原始对象缓存（代次一致时复用），避免每句都调用 tts.voices 枚举 */
+  @Volatile
+  private var cachedVoiceGeneration = -1
+
+  @Volatile
+  private var cachedVoiceObjects: List<android.speech.tts.Voice>? = null
+
+  @Volatile
+  private var cachedVoiceResults: List<VoiceResult>? = null
   private val defaultEngineObserverRegistered = AtomicBoolean(false)
   private val lastKnownDefaultEngine = AtomicReference<String?>(null)
   private val sessionRunner = TTSEngineRunner(
@@ -123,8 +170,7 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
           sessionRunner.stop()
           isInitialized.set(false)
           currentVoiceId.set("")
-          textToSpeech?.shutdown()
-          textToSpeech = null
+          resetTtsInstance()
         } catch (_: Exception) {
         }
       } else {
@@ -142,6 +188,22 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
 
   init {
     ensureDefaultEngineObserver()
+    // 注册媒体动作分发器：通知/锁屏/媒体按键的播放、暂停、停止统一转发给前端 JS
+    MediaPlaybackService.setActionDispatcher { action, positionMs ->
+      val data = JSObject().apply {
+        put("code", "media_action")
+        put("action", action)
+        if (positionMs != null) put("positionMs", positionMs)
+      }
+      println("[TTS][Plugin] media action dispatched action=$action positionMs=${positionMs ?: ""}")
+      trigger(CHANNEL_NAME, data)
+    }
+  }
+
+  override fun onDestroy() {
+    // 插件销毁后不再有 JS 接收者，清空分发器避免持有旧插件实例
+    MediaPlaybackService.setActionDispatcher(null)
+    super.onDestroy()
   }
 
   private fun ensureDefaultEngineObserver() {
@@ -176,20 +238,24 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
   private fun setBackgroundPlaybackActive(args: SetMediaSessionActiveArgs) {
     val title = args.foregroundServiceTitle ?: args.notificationTitle ?: MediaPlaybackService.DEFAULT_TITLE
     val text = args.foregroundServiceText ?: args.notificationText ?: MediaPlaybackService.DEFAULT_TEXT
-    val intent = Intent(activity, MediaPlaybackService::class.java).apply {
-      putExtra(MediaPlaybackService.EXTRA_TITLE, title)
-      putExtra(MediaPlaybackService.EXTRA_TEXT, text)
-    }
 
     if (args.active == true && args.keepAppInForeground == true) {
       println("[TTS][Plugin] background playback enable request channelId=${MediaPlaybackService.CHANNEL_ID} title=$title text=$text")
-      ContextCompat.startForegroundService(activity, intent)
-      println("[TTS][Plugin] background playback enabled")
+      // 启动/停止统一走 Service 的状态机，避免「启动后立刻停止」导致前台服务超时崩溃
+      val started = MediaPlaybackService.requestStart(activity, title, text)
+      println("[TTS][Plugin] background playback enabled=$started")
+      if (!started) {
+        // 启动失败（如 Android 12+ 后台启动限制）上报前端，便于提示用户
+        trigger(CHANNEL_NAME, JSObject().apply {
+          put("code", "background_service_error")
+          put("reason", "start_failed")
+        })
+      }
       return
     }
 
     println("[TTS][Plugin] background playback disable request channelId=${MediaPlaybackService.CHANNEL_ID}")
-    activity.stopService(intent)
+    MediaPlaybackService.requestStop(activity)
     println("[TTS][Plugin] background playback disabled")
   }
 
@@ -204,7 +270,7 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   private fun stopBackgroundService() {
-    activity.stopService(Intent(activity, MediaPlaybackService::class.java))
+    MediaPlaybackService.requestStop(activity)
   }
 
   private fun ensureInitialized(requestedLang: String?, onDone: (InitResult) -> Unit) {
@@ -218,6 +284,7 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
     val engine = resolveDefaultEngine()
     println("[TTS][Plugin] ensureInitialized: 开始初始化 requestedLang=${requestedLang ?: ""} defaultEngine=${engine ?: ""}")
     try {
+      invalidateVoiceCache()
       textToSpeech = TextToSpeech(activity, { status ->
         if (status == TextToSpeech.SUCCESS) {
           isInitialized.set(true)
@@ -298,8 +365,36 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
     return LangCheckResult(locale.toLanguageTag(), result)
   }
 
+  /** 销毁 TTS 实例并失效所有依赖实例的缓存 */
+  private fun resetTtsInstance() {
+    try {
+      textToSpeech?.shutdown()
+    } catch (_: Exception) {
+    }
+    textToSpeech = null
+    invalidateVoiceCache()
+  }
+
+  /** 失效语音列表缓存与已应用的音频配置（引擎实例变化或用户切换语音时调用） */
+  private fun invalidateVoiceCache() {
+    ttsGeneration.incrementAndGet()
+    cachedVoiceGeneration = -1
+    cachedVoiceObjects = null
+    cachedVoiceResults = null
+    appliedVoiceKey = null
+  }
+
+  /**
+   * 读取语音列表（带缓存）。
+   * tts.voices 是同步的引擎调用，在长句合成期间可能阻塞主线程数百毫秒到数秒，
+   * 因此同一个 TTS 实例只枚举一次，避免每条句段都触发。
+   */
   private fun readVoices(): List<VoiceResult>? {
     val tts = textToSpeech ?: return null
+    val generation = ttsGeneration.get()
+    if (cachedVoiceGeneration == generation && cachedVoiceResults != null) {
+      return cachedVoiceResults
+    }
     return try {
       val voices = tts.voices ?: return emptyList()
       fun isNetworkVoice(v: android.speech.tts.Voice): Boolean {
@@ -325,12 +420,29 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
         )
       }
 
-      val localOnly = voices.filterNot { isNetworkVoice(it) }.map { toResult(it) }
-      if (localOnly.isNotEmpty()) return localOnly
-      voices.map { toResult(it) }
+      // 优先本地语音；全部为网络语音时退回完整列表（与原行为一致）
+      val localOnly = voices.filterNot { isNetworkVoice(it) }
+      val picked: List<android.speech.tts.Voice> =
+        if (localOnly.isNotEmpty()) localOnly.toList() else voices.toList()
+      val results = picked.map { toResult(it) }
+      cachedVoiceGeneration = generation
+      cachedVoiceObjects = picked
+      cachedVoiceResults = results
+      results
     } catch (_: Exception) {
       null
     }
+  }
+
+  /** 按 voiceId 查语音对象，命中缓存时不再枚举引擎语音列表 */
+  private fun findCachedVoice(tts: TextToSpeech, voiceId: String): android.speech.tts.Voice? {
+    readVoices()
+    return cachedVoiceObjects?.firstOrNull { it.name == voiceId }
+      ?: try {
+        tts.voices?.firstOrNull { it.name == voiceId }
+      } catch (_: Exception) {
+        null
+      }
   }
 
   private fun setupListener() {
@@ -358,31 +470,48 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
     })
   }
 
+  /**
+   * 应用语音/语言到 TTS 引擎。
+   *
+   * 该函数在每次朗读句段前被调用（运行在主线程），而 tts.voices / tts.language
+   * 都是同步的引擎调用：长文合成期间可能阻塞主线程。
+   * 因此这里以「期望配置标识」做幂等判断，配置未变化时直接返回，不再触碰引擎。
+   */
   private fun applyVoiceAndLang(lang: String?) {
     val tts = textToSpeech ?: return
     val voiceId = currentVoiceId.get()
+    val effectiveLang = normalizeLang(lang) ?: normalizeLang(sessionLang)
+    val desiredKey = if (voiceId.isNotBlank()) "voice:$voiceId" else "lang:${effectiveLang ?: ""}"
+    if (appliedVoiceKey == desiredKey) return
+
     try {
       if (voiceId.isNotBlank()) {
-        val voice = tts.voices?.firstOrNull { it.name == voiceId }
+        val voice = findCachedVoice(tts, voiceId)
         if (voice != null) {
           tts.voice = voice
+          appliedVoiceKey = desiredKey
           println("[TTS][Plugin] applyVoice: hit voiceId=$voiceId voiceLocale=${voice.locale?.toLanguageTag() ?: ""}")
         } else {
+          // 未命中时保留旧配置，下次句段仍会重试
           println("[TTS][Plugin] applyVoice: miss voiceId=$voiceId")
         }
+        return
       }
-    } catch (_: Exception) {
-    }
-    if (voiceId.isNotBlank()) return
-    try {
-      val locale = toLocale(lang)
+
+      // 未选择自定义语音：通过设置语言让引擎回到该语言的默认语音
+      // （setLanguage 会重置当前 voice，这也是从自定义语音切回「默认」时恢复默认音色的手段）
+      val locale = toLocale(effectiveLang)
       if (locale != null) {
         tts.language = locale
-        println("[TTS][Plugin] applyLang: lang=${lang ?: ""} locale=${locale.toLanguageTag()}")
+        appliedVoiceKey = desiredKey
+        println("[TTS][Plugin] applyLang: lang=${effectiveLang ?: ""} locale=${locale.toLanguageTag()}")
       }
     } catch (_: Exception) {
     }
   }
+
+  /** 归一化语言标签：空白视为未提供 */
+  private fun normalizeLang(lang: String?): String? = lang?.trim()?.takeIf { it.isNotEmpty() }
 
   @Command
   fun init(invoke: Invoke) {
@@ -433,23 +562,18 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
     val v = (args.voice ?: "").trim()
     if (v.isBlank() || v == "default") {
       currentVoiceId.set("")
-      if (textToSpeech != null) {
-        try {
-          println("[TTS][Plugin] set_voice: 清空语音选择并重置 TTS 实例 defaultEngine=${resolveDefaultEngine() ?: ""}")
-          isInitialized.set(false)
-          textToSpeech?.shutdown()
-          textToSpeech = null
-        } catch (_: Exception) {
-        }
-      } else {
-        println("[TTS][Plugin] set_voice: 清空语音选择 defaultEngine=${resolveDefaultEngine() ?: ""}")
-      }
+      // 不再销毁 TTS 实例：销毁会让下次朗读触发完整的引擎重建 + 语音枚举（主线程重活），
+      // 只需让已应用的配置失效，下一句会通过设置语言恢复引擎默认语音。
+      appliedVoiceKey = null
+      println("[TTS][Plugin] set_voice: 清空语音选择（保留 TTS 实例）defaultEngine=${resolveDefaultEngine() ?: ""}")
       invoke.resolve()
       return
     }
 
     currentVoiceId.set(v)
-    val hit = try { textToSpeech?.voices?.any { it.name == v } ?: false } catch (_: Exception) { false }
+    appliedVoiceKey = null
+    val tts = textToSpeech
+    val hit = tts != null && findCachedVoice(tts, v) != null
     println("[TTS][Plugin] set_voice: voiceId=$v hit=$hit defaultEngine=${resolveDefaultEngine() ?: ""}")
     invoke.resolve()
   }
@@ -486,6 +610,40 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
+  /**
+   * 同步播放状态与通知文案（由前端会话回写）。
+   * Service 只渲染状态，不主动改变播放状态，避免与前端 TTSSession 双份状态。
+   */
+  @Command
+  fun set_playback_state(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(SetPlaybackStateArgs::class.java)
+      println("[TTS][Plugin] set_playback_state: state=${args.state ?: ""} title=${args.title ?: ""} text=${args.text ?: ""} position=${args.positionMs ?: ""} duration=${args.durationMs ?: ""} largeIcon=${args.largeIconPath?.take(32) ?: ""}")
+      // 防御：Service 可能被系统/厂商清理掉，但前端还以为后台保活仍开启。
+      // playing/paused 状态下如果服务不在，主动重建，否则通知永远不会再出现。
+      val state = args.state?.trim()?.lowercase()
+      if ((state == "playing" || state == "paused") && !MediaPlaybackService.isStartRequested()) {
+        val title = args.title ?: MediaPlaybackService.DEFAULT_TITLE
+        val text = args.text ?: MediaPlaybackService.DEFAULT_TEXT
+        println("[TTS][Plugin] set_playback_state: foreground service missing, restart title=$title text=$text")
+        MediaPlaybackService.requestStart(activity, title, text)
+      }
+      MediaPlaybackService.updatePlaybackState(
+        args.state,
+        args.title,
+        args.text,
+        args.largeIconPath,
+        args.positionMs,
+        args.durationMs,
+        args.canSkipPrevious,
+        args.canSkipNext,
+      )
+      invoke.resolve()
+    } catch (e: Exception) {
+      invoke.reject("Failed to set playback state: ${e.message}")
+    }
+  }
+
   @Command
   fun open_tts_settings(invoke: Invoke) {
     try {
@@ -519,8 +677,8 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
       sessionRunner.stop()
       stopBackgroundService()
       isInitialized.set(false)
-      textToSpeech?.shutdown()
-      textToSpeech = null
+      sessionLang = null
+      resetTtsInstance()
       invoke.resolve()
     } catch (e: Exception) {
       invoke.reject("Failed to shutdown: ${e.message}")
@@ -543,6 +701,8 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
       }
 
       try {
+        // 记住会话语言：句段自身不带 lang，用它在「默认语音」时恢复引擎默认音色
+        sessionLang = normalizeLang(args.lang)
         sessionRunner.start(
           segments = segments,
           rate = args.rate ?: 1.0f,
@@ -576,7 +736,7 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
   fun tts_session_stop(invoke: Invoke) {
     try {
       val args = invoke.parseArgs(TTSSessionStopArgs::class.java)
-      sessionRunner.stop(args.emitStoppedEvent ?: true)
+      sessionRunner.stop(args.emitStoppedEvent ?: true, args.stopService ?: true)
       try {
         textToSpeech?.stop()
       } catch (_: Exception) {
@@ -600,6 +760,8 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun tts_session_resume(invoke: Invoke) {
     try {
+      // 用户主动继续播放：清除音频焦点暂停标记，避免稍后又被自动恢复逻辑干扰
+      MediaPlaybackService.notifyUserResumed()
       sessionRunner.resume()
       invoke.resolve()
     } catch (e: Exception) {

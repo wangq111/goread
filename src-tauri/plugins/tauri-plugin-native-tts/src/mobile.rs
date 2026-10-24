@@ -54,6 +54,12 @@ impl<R: Runtime> NativeTts<R> {
             .map_err(Into::into)
     }
 
+    pub fn set_playback_state(&self, payload: SetPlaybackStateRequest) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin("set_playback_state", payload)
+            .map_err(Into::into)
+    }
+
     pub fn open_tts_settings(&self) -> crate::Result<()> {
         self.0
             .run_mobile_plugin("open_tts_settings", ())
@@ -87,6 +93,7 @@ impl<R: Runtime> NativeTts<R> {
     pub fn tts_session_stop(&self) -> crate::Result<()> {
         self.tts_session_stop_with_request(TTSSessionStopRequest {
             emit_stopped_event: true,
+            stop_service: None,
         })
     }
 

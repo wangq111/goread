@@ -7,16 +7,14 @@ import { TocOverlay } from "./reader/TocOverlay";
 import { ModeOverlay } from "./reader/ModeOverlay";
 import { MoreDrawer } from "./reader/MoreDrawer";
 import { PageDivider } from "./reader/PageDivider";
-import { CropOverlay } from "./reader/CropOverlay";
 import { Toast } from "./Toast";
 import { Loading } from "./Loading";
 import { ExternalFileOpenPayload } from "../types";
 import { IBookRenderer } from "../services/formats";
-import {
-  TOAST_DURATION_LONG_MS,
-  TOAST_DURATION_ERROR_MS,
-} from "../constants/config";
-import { getSafeAreaInsets } from "../utils/layout";
+import { captureBookmarkPosition } from "./reader/utils/bookmarkPosition";
+import { parseChapterTitle } from "./reader/utils/chapterTitle";
+import { getPlaceholderCanvasSize } from "../utils/canvasPlaceholder";
+import { getReaderPageBackground, getReaderPaperShadow } from "../constants/readerTheme";
 import { useAppNav } from "../router/useAppNav";
 
 
@@ -35,7 +33,6 @@ import {
   useVolumeNavigation,
   useDomRenderer,
   useInitReader,
-  useCapture,
   useResizeHandler,
   useAutoMark,
   useModeSwitch,
@@ -54,9 +51,14 @@ import {
   useContentPinchZoom,
   useReaderTTS,
   useBookFontSize,
+  useReaderStatusBar,
+  useReaderViewportInset,
 } from "./reader/hooks";
 
 import { UndoJumpIcon } from "./covers/UndoJumpIcon";
+
+/** 顶部页码气泡 / 撤回跳转按钮相对顶部安全区的偏移（控制栏自身高度约 72px） */
+const READER_CHROME_TOP_OFFSET = 72;
 
 
 export const Reader: React.FC = () => {
@@ -94,6 +96,8 @@ export const Reader: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const mainViewRef = useRef<HTMLDivElement>(null);
   const verticalScrollRef = useRef<HTMLDivElement>(null);
+  // PDF 纵向模式下真正被缩放的容器（页面内容包裹层）
+  const zoomContentRef = useRef<HTMLDivElement>(null);
   const verticalCanvasRefs = useRef<Map<number, HTMLCanvasElement>>(new Map());
 
   // 2. 设置与会话 (传递 rendererRef 以支持 EPUB 同步)
@@ -142,25 +146,6 @@ export const Reader: React.FC = () => {
   useExternalVisibility(isExternal);
 
 
-  // TTS 听书
-  const {
-    listenSupported,
-    isListening,
-    handleToggleListen,
-    stopListenSilently,
-    listenToastMsg,
-    clearListenToast,
-    notifyTtsDocumentUpdated,
-    markTtsViewOutOfSync,
-  } = useReaderTTS({
-    rendererRef,
-    isEpubDom,
-    isMobi,
-    isTxt,
-    readingMode,
-    onReadingActivity: !isExternal ? markReadingActive : undefined,
-  });
-
   // 3. UI 状态
   const [uiVisible, setUiVisible] = useState(false);
   const [tocOverlayOpen, setTocOverlayOpen] = useState(false);
@@ -170,8 +155,52 @@ export const Reader: React.FC = () => {
   const [isSeeking, setIsSeeking] = useState(false);
   const [seekPage, setSeekPage] = useState<number | null>(null);
 
+  // 状态栏控制：仅在阅读页内生效，离开时恢复应用默认
+  // 工具栏/目录/模式/更多这些深色浮层会盖住状态栏区域，此时不需要色条、图标用浅色
+  const darkChromeOnStatusBar =
+    uiVisible || isSeeking || tocOverlayOpen || modeOverlayOpen || moreDrawerOpen;
+  // 阅读页配色：全屏统一用主题页面底色（正文页、画布四周、让位带都是它），
+  // 页面边界靠纸张投影（纸色与底色同色时，投影/描边是唯一的区分手段）
+  const pageBackgroundColor = getReaderPageBackground(isThemeSupported ? effectiveTheme : "light");
+  const paperShadow = getReaderPaperShadow(effectiveTheme);
+
+  const readerStatusBar = useReaderStatusBar({
+    showStatusBar: settings.showStatusBar,
+    // 让位带底色 = 页面底色，图标明暗由实际颜色推断
+    bandBackgroundColor: pageBackgroundColor,
+    darkChromeVisible: darkChromeOnStatusBar,
+  });
+
+  // 内容视口的顶部让位：仅由「系统状态栏可见」决定，
+  // 否则控制栏显示/隐藏时 padding 变化会让正文上下跳动
+  const viewportInset = useReaderViewportInset(settings.showStatusBar);
+  // 顶部浮层（页码气泡 / 撤回跳转）只在控制栏可见时渲染，恒定需要避开状态栏
+  const chromeInset = useReaderViewportInset(true);
+
   // 4. 数据 Hooks (TOC, Bookmarks)
   const tocData = useToc(currentPage, readingMode, isDomRender);
+
+  // TTS 听书（依赖 tocData 取当前章节名，用于媒体通知动态文案）
+  const {
+    listenSupported,
+    isListening,
+    handleToggleListen,
+    stopListenAndRestore,
+    listenToastMsg,
+    clearListenToast,
+    notifyTtsDocumentUpdated,
+  } = useReaderTTS({
+    rendererRef,
+    isEpubDom,
+    isMobi,
+    isTxt,
+    onReadingActivity: !isExternal ? markReadingActive : undefined,
+    // 媒体通知标题/副标题/封面（仅 Android 原生通知使用）
+    notificationTitle: (isExternal ? externalTitle : book?.title) || undefined,
+    notificationSubtitle: parseChapterTitle(tocData.activeNodeSignature) ?? undefined,
+    notificationBookId: !isExternal ? book?.id : undefined,
+  });
+
   const bookmarkData = useBookmarks(book, isExternal);
   const { hideDivider, setHideDivider } = useBookPageDivider(book);
   const tocSort = useTocSort(tocData.toc, book);
@@ -229,6 +258,7 @@ export const Reader: React.FC = () => {
     toc: tocData.toc,
     setActiveNodeSignature: tocData.setActiveNodeSignature,
     onAfterRerender: notifyTtsDocumentUpdated,
+    markReadingActive,
   });
 
 
@@ -319,7 +349,6 @@ export const Reader: React.FC = () => {
       readingMode,
       isExternal,
       markReadingActive,
-      onUserNavigate: (pageNum) => markTtsViewOutOfSync(pageNum),
     }
   });
 
@@ -352,24 +381,6 @@ export const Reader: React.FC = () => {
     prevPage: navigation.prevPage
   });
 
-  // 截图
-  const capture = useCapture({
-    readerState,
-    refs: {
-      dataset: {
-        domContainerRef: domRenderer.domContainerRef,
-        canvasRef,
-        verticalScrollRef,
-        verticalCanvasRefs
-      }
-    },
-    data: { readingMode, settings: settingsWithTheme },
-    actions: {
-      setUiVisible,
-      setMoreDrawerOpen,
-    }
-  });
-
   // 窗口调整
   useResizeHandler({
     data: { readingMode, currentPage },
@@ -383,8 +394,20 @@ export const Reader: React.FC = () => {
 
   const getZoomContentElement = useCallback(() => {
     if (readingMode === "horizontal") return canvasRef.current;
-    return verticalScrollRef.current;
+    // 纵向模式必须缩放“内容包裹层”：它将内容撑满整篇文档高度，
+    // 若直接缩放滚动列，超出滚动列高度的部分会被裁剪，拖动时只能看到黑屏
+    return zoomContentRef.current;
   }, [readingMode]);
+
+  /**
+   * 缩放平移不会触发原生滚动，IntersectionObserver 也就无法感知进入可视区域的页面，
+   * 因此这里在每次变换提交后手动补齐：
+   * 只补渲染与视口相交且尚未渲染的页面（不渲染视口上方的页面，避免其尺寸变化导致画面跳动）
+   */
+  const renderPendingVisiblePagesRef = useRef<() => void>(() => {});
+  const handleTransformCommit = useCallback(() => {
+    renderPendingVisiblePagesRef.current();
+  }, []);
 
   const zoom = useContentPinchZoom({
     enabled:
@@ -393,20 +416,51 @@ export const Reader: React.FC = () => {
       !isSeeking &&
       !tocOverlayOpen &&
       !modeOverlayOpen &&
-      !moreDrawerOpen &&
-      !capture.cropMode,
+      !moreDrawerOpen,
     viewportRef: mainViewRef,
     getContentElement: getZoomContentElement,
     minScale: 1,
     maxScale: 4,
     tapMoveThresholdPx: 6,
+    onTransformCommit: handleTransformCommit,
   });
 
+  const renderPendingVisiblePages = useCallback(() => {
+    if (!isPdf || readingMode !== "vertical") return;
+    const viewportEl = mainViewRef.current;
+    if (!viewportEl) return;
+
+    const vpRect = viewportEl.getBoundingClientRect();
+    const { renderedPagesRef, renderQueueRef, renderPageToTarget } = pageRenderer;
+    const pending: Promise<void>[] = [];
+
+    verticalCanvasRefs.current.forEach((canvasEl, pageNum) => {
+      if (!canvasEl) return;
+      if (renderedPagesRef.current.has(pageNum)) return;
+      if (renderQueueRef.current.has(pageNum)) return;
+
+      const rect = canvasEl.getBoundingClientRect();
+      // 完全位于视口上方的页面暂不渲染：渲染会改变其高度，导致当前画面位置跳动
+      if (rect.bottom <= vpRect.top) return;
+      if (rect.top >= vpRect.bottom) return;
+
+      pending.push(renderPageToTarget(pageNum, canvasEl));
+    });
+
+    if (pending.length > 0) {
+      // 页面渲染完成后高度会变化，需要重新夹取平移量，避免底部露出背景
+      Promise.all(pending).then(() => zoom.reclamp()).catch(() => {});
+    }
+  }, [isPdf, pageRenderer, readingMode, zoom.reclamp]);
+
+  // 通过 ref 转发，避免 zoom 与回调之间的循环依赖
+  renderPendingVisiblePagesRef.current = renderPendingVisiblePages;
+
   useEffect(() => {
-    if (tocOverlayOpen || modeOverlayOpen || moreDrawerOpen || capture.cropMode) {
+    if (tocOverlayOpen || modeOverlayOpen || moreDrawerOpen) {
       zoom.reset();
     }
-  }, [capture.cropMode, moreDrawerOpen, modeOverlayOpen, tocOverlayOpen, zoom.reset]);
+  }, [moreDrawerOpen, modeOverlayOpen, tocOverlayOpen, zoom.reset]);
 
   useEffect(() => {
     zoom.reset();
@@ -452,15 +506,34 @@ export const Reader: React.FC = () => {
 
   return (
     <div
-      className="reader-fullheight"
+      className="reader-fullheight reader-viewport"
       style={{
         display: "flex",
         position: "relative",
         flexDirection: "column",
-        backgroundColor: effectiveTheme === 'dark' ? "#000000" : "#2c2c2c",
-        paddingTop: settingsWithTheme.showStatusBar ? getSafeAreaInsets().top : 0,
+        // 根容器底色 = 页面底色：状态栏/挖孔让位带（视口 padding 区，含横屏左右）与正文页同色
+        backgroundColor: pageBackgroundColor,
+        // 顶部状态栏让位：高度以 CSS 变量交给 .reader-viewport 的 padding-top 处理，
+        // 组件不再手写 padding（盒模型约束集中在 CSS 里声明）
+        ...viewportInset.viewportStyle,
       }}
     >
+      {/* 状态栏区域色条：与根容器同色，仅用于压住首页 boxShadow 向上溢出的阴影 */}
+      {readerStatusBar.showStatusBarStrip && (
+        <div
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            right: 0,
+            height: viewportInset.topInset,
+            backgroundColor: pageBackgroundColor,
+            // 置于内容之上，避免首页 boxShadow 溢出到色条上
+            zIndex: 1,
+            pointerEvents: "none",
+          }}
+        />
+      )}
       {/* 主体区域 */}
       <div
         style={{
@@ -481,6 +554,8 @@ export const Reader: React.FC = () => {
             overflow: (isPdf && zoom.isZoomed) || tocOverlayOpen || modeOverlayOpen || (isEpubDom && readingMode === "horizontal") ? "hidden" : "auto",
             padding: 0,
             position: "relative",
+            // 画布四周/页间空隙与正文页同色（全屏统一底色），页边界由纸张投影保证
+            backgroundColor: pageBackgroundColor,
           }}
           ref={mainViewRef}
         >
@@ -504,15 +579,11 @@ export const Reader: React.FC = () => {
                         height: "100%",
                       }
                 ),
-                overflowY: isEpubDom && readingMode === "horizontal" ? "hidden" : "auto",
-                touchAction: isEpubDom && readingMode === "horizontal" ? "pan-y" : "auto",
-                backgroundColor: isEpubDom
-                  ? effectiveTheme === "dark"
-                    ? "#000000"
-                    : "#ffffff"
-                  : effectiveTheme === "dark"
-                  ? "#000000"
-                  : "#1a1a1a",
+                overflowY: (isEpubDom || isTxt) && readingMode === "horizontal" ? "hidden" : "auto",
+                touchAction: (isEpubDom || isTxt) && readingMode === "horizontal" ? "pan-y" : "auto",
+                // TXT 保持透明（内容自带底色）；其余 DOM 格式用页面底色，
+                // 与 Shadow DOM 内的内容底色及让位带保持一致（避免深色/护眼主题下出现色差）
+                backgroundColor: isTxt ? "transparent" : pageBackgroundColor,
                 pointerEvents: "auto",
               }}
             />
@@ -524,8 +595,9 @@ export const Reader: React.FC = () => {
               style={{
                 width: "100%",
                 height: "auto",
-                boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
-                backgroundColor: loading ? (effectiveTheme === 'dark' ? "#000000" : "#2a2a2a") : "transparent",
+                boxShadow: paperShadow,
+                // 画布即“纸”：底色用纸色，翻页重建画布时不会闪出台面色
+                backgroundColor: pageBackgroundColor,
                 ...(isPdf ? zoom.contentStyle : {}),
               }}
             />
@@ -535,45 +607,55 @@ export const Reader: React.FC = () => {
                 width: "100%",
                 maxHeight: "100%",
                 overflowY: isPdf && zoom.isZoomed ? "hidden" : "auto",
-                ...(isPdf ? zoom.contentStyle : {}),
+                // 缩放时禁用原生滚动，统一由 transform 平移处理
+                touchAction: isPdf ? (zoom.isZoomed ? "none" : "pan-y") : undefined,
               }}
               className="no-scrollbar"
               ref={verticalScrollRef}
             >
-              {Array.from({ length: totalPages }, (_, i) => i + 1).map((p) => {
-                const pageGap = settingsWithTheme.pageGap ?? 4;
-                const dividerBandHeight = pageGap * 2 + 1;
-                return (
-                  <React.Fragment key={`${bookId}-${p}`}>
-                    {p > 1 && (
-                      <PageDivider
-                        height={dividerBandHeight}
-                        color={effectiveTheme === "dark" ? "#ffffff" : "#000000"}
-                        hidden={hideDivider}
-                      />
-                    )}
-                    <canvas
-                      data-page={p}
-                      ref={(el) => {
-                        if (el) {
+              {/* 缩放作用在内容包裹层上，保证拖动时展示的是真实内容而不是被裁剪的滚动列 */}
+              <div ref={zoomContentRef} style={isPdf ? zoom.contentStyle : undefined}>
+                {Array.from({ length: totalPages }, (_, i) => i + 1).map((p) => {
+                  const pageGap = settingsWithTheme.pageGap ?? 4;
+                  const dividerBandHeight = pageGap * 2 + 1;
+                  return (
+                    <React.Fragment key={`${bookId}-${p}`}>
+                      {p > 1 && (
+                        <PageDivider
+                          height={dividerBandHeight}
+                          color={effectiveTheme === "dark" ? "#ffffff" : "#000000"}
+                          hidden={hideDivider}
+                        />
+                      )}
+                      <canvas
+                        data-page={p}
+                        ref={(el) => {
+                          if (!el) return;
                           verticalCanvasRefs.current.set(p, el);
-                          if (el.height === 0) {
-                            el.height = 800;
-                          }
-                        }
-                      }}
-                      style={{
-                        width: "100%",
-                        minHeight: "600px",
-                        display: "block",
-                        margin: "0 auto",
-                        boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
-                        backgroundColor: effectiveTheme === 'dark' ? "#000000" : "#2a2a2a",
-                      }}
-                    />
-                  </React.Fragment>
-                );
-              })}
+                          // 仅在占位阶段设置初始尺寸：
+                          // 设置 canvas 的 width/height 属性会清空画面，已渲染的页面不能再动
+                          if (el.dataset.placeholder === "0") return;
+                          el.dataset.placeholder = "0";
+                          const size = getPlaceholderCanvasSize(
+                            rendererRef.current?.getPageSize?.(p)
+                          );
+                          el.width = size.width;
+                          el.height = size.height;
+                        }}
+                        style={{
+                          width: "100%",
+                          minHeight: "600px",
+                          display: "block",
+                          margin: "0 auto",
+                          boxShadow: paperShadow,
+                          // 尚未渲染的页也用纸色占位，避免深灰占位块闪烁
+                          backgroundColor: pageBackgroundColor,
+                        }}
+                      />
+                    </React.Fragment>
+                  );
+                })}
+              </div>
             </div>
           )}
         </div>
@@ -585,7 +667,7 @@ export const Reader: React.FC = () => {
           text={tCommon('loading')}
           showSpinner={false}
           textStyle={{ fontSize: 16 }}
-          overlayColor={effectiveTheme === 'dark' ? "#000000" : "#ffffff"}
+          overlayColor={pageBackgroundColor}
           zIndex={999}
           overlayStyle={{ position: 'absolute', inset: 0 }}
         />
@@ -609,95 +691,75 @@ export const Reader: React.FC = () => {
         }}
       />
 
-      {/* 顶部页码气泡 */}
-      {(uiVisible || isSeeking) && !moreDrawerOpen && !tocOverlayOpen && !modeOverlayOpen &&
-        (() => {
-          const toolbarVisible = uiVisible || isSeeking;
-          const baseOffsetPx = toolbarVisible ? 72 : 14;
-          const safeAreaTop = getSafeAreaInsets().top;
-          const shouldIncludeSafeArea = toolbarVisible || settings.showStatusBar;
-          const topStyle = shouldIncludeSafeArea
-            ? `calc(${safeAreaTop} + ${baseOffsetPx}px)`
-            : `${baseOffsetPx}px`;
-          return (
-            <div
-              style={{
-                position: "fixed",
-                top: topStyle,
-                left: "calc(env(safe-area-inset-left) + 12px)",
-                display: "block",
-                pointerEvents: "none",
-                zIndex: 11,
-              }}
-            >
-              <div
-                style={{
-                  padding: "6px 12px",
-                  borderRadius: "18px",
-                  backgroundColor: "rgba(0,0,0,0.75)",
-                  color: "#fff",
-                  fontSize: "12px",
-                  boxShadow: "0 2px 6px rgba(0,0,0,0.25)",
-                }}
-              >
-                {Math.floor(isSeeking && seekPage !== null ? seekPage : currentPage)} / {totalPages}
-              </div>
-            </div>
-          );
-        })()}
+      {/* 顶部页码气泡：仅控制栏可见时渲染，故恒定让位顶部安全区 */}
+      {(uiVisible || isSeeking) && !moreDrawerOpen && !tocOverlayOpen && !modeOverlayOpen && (
+        <div
+          style={{
+            position: "fixed",
+            top: chromeInset.topOffset(READER_CHROME_TOP_OFFSET),
+            // 左右避让物理遮挡：Android 上 env() 不可靠，统一用原生注入的安全区变量
+            left: "calc(var(--display-cutout-inset-left, 0px) + 12px)",
+            display: "block",
+            pointerEvents: "none",
+            zIndex: 11,
+          }}
+        >
+          <div
+            style={{
+              padding: "6px 12px",
+              borderRadius: "18px",
+              backgroundColor: "rgba(0,0,0,0.75)",
+              color: "#fff",
+              fontSize: "12px",
+              boxShadow: "0 2px 6px rgba(0,0,0,0.25)",
+            }}
+          >
+            {Math.floor(isSeeking && seekPage !== null ? seekPage : currentPage)} / {totalPages}
+          </div>
+        </div>
+      )}
 
-      {/* 撤回跳转按钮 */}
+      {/* 撤回跳转按钮：同样只在控制栏可见时渲染 */}
       {(uiVisible || isSeeking) && !moreDrawerOpen && !tocOverlayOpen && !modeOverlayOpen && undoJump.undoJumpState?.active &&
-        (() => {
-          const toolbarVisible = uiVisible || isSeeking;
-          const baseOffsetPx = toolbarVisible ? 72 : 14;
-          const safeAreaTop = getSafeAreaInsets().top;
-          const shouldIncludeSafeArea = toolbarVisible || settings.showStatusBar;
-          const topStyle = shouldIncludeSafeArea
-            ? `calc(${safeAreaTop} + ${baseOffsetPx}px)`
-            : `${baseOffsetPx}px`;
-
-          return (
-            <div
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                undoJump.performUndo();
-              }}
-              style={{
-                position: "fixed",
-                top: topStyle,
-                right: "calc(env(safe-area-inset-right) + 12px)",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: "6px",
-                zIndex: 11,
-                padding: "0 14px",
-                height: "32px",
-                borderRadius: "16px",
-                backgroundColor: "rgba(40, 40, 40, 0.9)",
-                color: "rgba(255, 255, 255, 0.95)",
-                fontSize: "12px",
-                boxShadow: "0 4px 12px rgba(0,0,0,0.1)",
-                backdropFilter: "blur(4px)",
-                cursor: "pointer",
-                userSelect: "none",
-                // 简单进入动画
-                animation: "fadeSlideIn 0.35s cubic-bezier(0.34, 1.56, 0.64, 1)",
-              }}
-            >
-              <UndoJumpIcon size={14} />
-              <span>撤回跳转</span>
-              <style>{`
-                @keyframes fadeSlideIn {
-                  from { opacity: 0; transform: translateX(15px); }
-                  to { opacity: 1; transform: translateX(0); }
-                }
-              `}</style>
-            </div>
-          );
-        })()}
+        <div
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            undoJump.performUndo();
+          }}
+          style={{
+            position: "fixed",
+            top: chromeInset.topOffset(READER_CHROME_TOP_OFFSET),
+            right: "calc(var(--display-cutout-inset-right, 0px) + 12px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: "6px",
+            zIndex: 11,
+            padding: "0 14px",
+            height: "32px",
+            borderRadius: "16px",
+            backgroundColor: "rgba(40, 40, 40, 0.9)",
+            color: "rgba(255, 255, 255, 0.95)",
+            fontSize: "12px",
+            boxShadow: "0 4px 12px rgba(0,0,0,0.1)",
+            backdropFilter: "blur(4px)",
+            cursor: "pointer",
+            userSelect: "none",
+            // 简单进入动画
+            animation: "fadeSlideIn 0.35s cubic-bezier(0.34, 1.56, 0.64, 1)",
+          }}
+        >
+          <UndoJumpIcon size={14} />
+          <span>撤回跳转</span>
+          <style>{`
+            @keyframes fadeSlideIn {
+              from { opacity: 0; transform: translateX(15px); }
+              to { opacity: 1; transform: translateX(0); }
+            }
+          `}</style>
+        </div>
+      }
 
       <TocOverlay
         visible={tocOverlayOpen}
@@ -753,7 +815,7 @@ export const Reader: React.FC = () => {
       <ModeOverlay
         visible={modeOverlayOpen}
         readingMode={readingMode}
-        horizontalDisabled={isMobi || isMarkdown || isHtml || isTxt}
+        horizontalDisabled={isMobi || isMarkdown || isHtml}
         onClose={() => {
           setModeOverlayOpen(false);
           setUiVisible(false);
@@ -766,7 +828,8 @@ export const Reader: React.FC = () => {
           }
 
           if (listenSupported) {
-            await stopListenSilently();
+            // 朗读中切换模式：先把朗读位置写回阅读器，再停止，保证进度连续
+            await stopListenAndRestore();
           }
 
           // 更新书籍级阅读模式配置
@@ -842,7 +905,13 @@ export const Reader: React.FC = () => {
           }
         }}
         onAddBookmark={isExternal ? () => { } : async () => {
-          await bookmarkData.addBookmark(currentPage);
+          const position = captureBookmarkPosition(rendererRef.current, currentPage);
+          const chapterTitle = parseChapterTitle(tocData.activeNodeSignature);
+          await bookmarkData.addBookmark(
+            position.pageNumber,
+            chapterTitle ?? undefined,
+            position.preciseProgress
+          );
           setUiVisible(false);
         }}
         onOpenMore={() => setMoreDrawerOpen(true)}
@@ -854,28 +923,12 @@ export const Reader: React.FC = () => {
           setMoreDrawerOpen(false);
           setUiVisible(false);
         }}
-        onCapture={capture.handleCapture}
         onSettings={() => {
           setMoreDrawerOpen(false);
           nav.toSettings();
         }}
         hideDivider={hideDivider}
         onToggleHideDivider={() => setHideDivider(!hideDivider)}
-      />
-
-      <CropOverlay
-        visible={capture.cropMode}
-        capturedImage={capture.capturedImage}
-        onClose={() => {
-          capture.closeCrop();
-        }}
-        onSaveSuccess={() => {
-          bookmarkData.showToast(tCommon('saveSuccess'), TOAST_DURATION_LONG_MS);
-        }}
-        onSaveError={(msg: string) => {
-          const cleanMsg = msg.replace(/^Error:\s*/i, '');
-          bookmarkData.showToast(tCommon('saveFailedWithReason', { reason: cleanMsg }), TOAST_DURATION_ERROR_MS);
-        }}
       />
 
       {/* 全局 Toast 提示 */}

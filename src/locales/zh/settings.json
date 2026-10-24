@@ -4,6 +4,10 @@
   "clickTurnPage": "点击翻页",
   "showStatusBar": "显示状态栏",
   "recentDisplayCount": "最近显示数量",
+  "defaultFontSize": "默认字号",
+  "defaultReadingMode": "默认阅读方式",
+  "horizontalReading": "横向阅读",
+  "verticalReading": "纵向阅读",
   "renderQuality": "书籍渲染质量",
   "language": "多语言 (Language)",
   "languageFollowSystem": "跟随系统",
@@ -17,6 +21,9 @@
   "ttsVoice": "语音选择",
   "ttsVoiceSystemDefault": "系统默认",
   "ttsVoiceLoadFailed": "无可用语音",
+  "ttsNotificationPermission": "朗读通知权限",
+  "ttsNotificationEnabled": "已开启",
+  "ttsNotificationEnable": "去开启",
   "ttsRate": "听书语速",
   "unlimited": "不限",
   "cacheExpiry": {
@@ -24,6 +31,15 @@
     "unlimitedHint": "缓存不会过期，每种格式独立缓存上限约 256MB，超出自动淘汰最少使用的内容",
     "days": "{{count}} 天",
     "updateSuccess": "配置更新完成"
+  },
+  "nasCache": {
+    "label": "网络书架缓存",
+    "filesUnit": "个文件",
+    "unavailable": "统计不可用",
+    "clear": "清空",
+    "confirmClear": "确认清空？",
+    "clearSuccess": "已清空 {{count}} 个缓存文件",
+    "clearFailed": "清空失败，请重试"
   },
   "theme": {
     "label": "阅读主题",

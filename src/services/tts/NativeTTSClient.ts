@@ -1,8 +1,9 @@
 import type { ITTSClient } from './TTSClient';
-import type { TTSVoice } from './types';
+import type { TTSState, TTSVoice } from './types';
 import { TTS_RATE_DEFAULT } from '../../constants/tts';
 import { loadTauriCore } from './core/tauriCore';
 import { NativeSessionDriver } from './drivers/NativeSessionDriver';
+import { isAndroid } from '../../utils/platform';
 import { log, logError } from '../index';
 
 declare global {
@@ -129,6 +130,11 @@ export class NativeTTSClient implements ITTSClient {
     return this.#currentVoiceId;
   }
 
+  /** 当前主语言（仅用于语速档案的 key） */
+  getPrimaryLang(): string {
+    return this.#primaryLang;
+  }
+
   setPrimaryLang(lang: string): void {
     this.#primaryLang = lang;
   }
@@ -230,7 +236,6 @@ export class NativeTTSClient implements ITTSClient {
       };
       const normalized = this.#normalizeVoices(res.voices);
       this.#voices = normalized.length > 0 ? normalized : [this.#defaultVoice()];
-      await this.#setBackgroundPlaybackActive(true);
       log(
         `[TTS][Native] plugin init ok status=${this.#initInfo.status} defaultEngine=${this.#initInfo.defaultEngine ?? ''} voices=${this.#voices.length}`,
         'info',
@@ -239,6 +244,57 @@ export class NativeTTSClient implements ITTSClient {
     } catch (e) {
       logError('[TTS][Native] plugin 初始化异常', e);
       return false;
+    }
+  }
+
+  /**
+   * 把朗读状态同步到 Android 前台服务的媒体通知（仅 plugin 模式有效）。
+   *
+   * - playing：先确保前台服务在跑（真正开始播放才启动）
+   * - paused：保留通知与 Service（暂停不停止，方便继续播放）
+   * - stopped：立即停止 Service 与通知
+   * 状态由前端会话回写，Service 只渲染不决策。
+   */
+  async setPlaybackState(
+    state: TTSState,
+    title?: string,
+    text?: string,
+    largeIconPath?: string,
+    positionMs?: number,
+    durationMs?: number,
+    canSkipPrevious?: boolean,
+    canSkipNext?: boolean,
+  ): Promise<void> {
+    // 媒体通知/锁屏能力：Android 走前台服务；iOS 走系统 Now Playing 卡片。
+    // 二者都由原生插件承载，故 plugin 模式下 Android/iOS 都下发，桌面/Web 不下发。
+    if (this.#mode !== 'plugin' || !(isAndroid() || isIOSLikePlatform())) return;
+    try {
+      if (state === 'playing') {
+        // 播放中确保前台服务在跑（Android）或激活音频会话（iOS），暂停后仍保持以显示控制
+        await this.#setBackgroundPlaybackActive(true, title, text);
+      } else if (state === 'paused') {
+        // 暂停不停止原生会话：媒体通知/控制卡片可继续播放
+      } else {
+        await this.#setBackgroundPlaybackActive(false);
+      }
+
+      const core = await loadTauriCore();
+      if (!core?.invoke) return;
+      await core.invoke('native_tts_set_playback_state', {
+        payload: {
+          state,
+          title,
+          text,
+          largeIconPath,
+          positionMs,
+          durationMs,
+          canSkipPrevious,
+          canSkipNext,
+        },
+      });
+    } catch (e) {
+      // 状态同步失败不影响朗读
+      logError('[TTS][Native] 同步播放状态失败', e);
     }
   }
 
@@ -262,6 +318,8 @@ export class NativeTTSClient implements ITTSClient {
           const normalized = this.#normalizeVoices(voices);
           this.#voices = normalized.length > 0 ? normalized : this.#tryReadVoicesFromBridge();
           log(`[TTS][Native] bridge init ok status=${s} voices=${this.#voices.length}`, 'info');
+          // bridge 模式没有前台服务：后台朗读时不会有通知/锁屏控制，便于定位类似问题
+          log('[TTS][Native] bridge 模式无前台保活服务，后台朗读不会有通知', 'warn');
         } else {
           this.#initInfo = { mode: 'none', status: status || 'init_error', offlineReady: false };
           log(`[TTS][Native] bridge init failed status=${status || 'init_error'}`, 'warn');
@@ -317,12 +375,19 @@ export class NativeTTSClient implements ITTSClient {
     }
   }
 
-  async #setBackgroundPlaybackActive(active: boolean): Promise<void> {
+  async #setBackgroundPlaybackActive(
+    active: boolean,
+    title?: string,
+    text?: string,
+  ): Promise<void> {
     if (this.#backgroundPlaybackActive === active) return;
     const core = await loadTauriCore();
     if (!core?.invoke) return;
 
-    // 中文注释：iOS 没有 Android 前台服务语义，这里只保留音频会话激活，不再要求 keep foreground。
+    // 启动时带上真实文案，避免首个通知先闪默认文案、下一次 notify 才更新
+    const notificationTitle = title || 'GoRead TTS';
+    const notificationText = text || 'Reading in background';
+    // iOS 没有 Android 前台服务语义，只保留音频会话激活，不再要求 keep foreground
     const payload: SetMediaSessionActivePayload = active
       ? (isIOSLikePlatform()
           ? {
@@ -332,10 +397,10 @@ export class NativeTTSClient implements ITTSClient {
           : {
               active: true,
               keepAppInForeground: true,
-              notificationTitle: 'GoRead TTS',
-              notificationText: 'Reading in background',
-              foregroundServiceTitle: 'GoRead TTS',
-              foregroundServiceText: 'Reading in background',
+              notificationTitle,
+              notificationText,
+              foregroundServiceTitle: notificationTitle,
+              foregroundServiceText: notificationText,
             })
       : {
           active: false,
@@ -351,4 +416,5 @@ export class NativeTTSClient implements ITTSClient {
     }
   }
 }
+
 
