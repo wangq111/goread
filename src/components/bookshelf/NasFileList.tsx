@@ -59,6 +59,10 @@ export const NasFileList: React.FC<NasFileListProps> = ({
 
   // 监听后端下载进度事件（与「导入-NAS」页共用 goread:nas:download 事件）
   useEffect(() => {
+    // React StrictMode（dev）下 effect 会经历 mount→cleanup→re-mount 双执行：
+    // cleanup 置 unmountedRef=true 后 re-mount 不会自动复位，必须在此显式重置，
+    // 否则该标志永久为 true，后续所有 `!unmountedRef.current` 分支（浮层/跳转/提示）被吞
+    unmountedRef.current = false;
     const unlisten = listen<NasDownloadProgress>("goread:nas:download", (e) => {
       if (!unmountedRef.current) setProgress(e.payload);
     });
