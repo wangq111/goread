@@ -33,6 +33,15 @@
     "days_plural": "{{count}} days",
     "updateSuccess": "Settings updated"
   },
+  "nasCache": {
+    "label": "Web Bookshelf Cache",
+    "filesUnit": "file(s)",
+    "unavailable": "Unavailable",
+    "clear": "Clear",
+    "confirmClear": "Confirm clear?",
+    "clearSuccess": "Cleared {{count}} cached file(s)",
+    "clearFailed": "Clear failed, please retry"
+  },
   "theme": {
     "label": "Reading Theme",
     "light": "Light",

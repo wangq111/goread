@@ -163,6 +163,17 @@ pub async fn init_database(db: DbState<'_>) -> Result<(), Error> {
         .execute(&*pool)
         .await;
 
+    // NAS 网络书架字段迁移：来源标识、连接 id 与远端路径（缓存书身份定位用）
+    let _ = sqlx::query("ALTER TABLE books ADD COLUMN source TEXT")
+        .execute(&*pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE books ADD COLUMN source_conn_id TEXT")
+        .execute(&*pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE books ADD COLUMN source_path TEXT")
+        .execute(&*pool)
+        .await;
+
     // 书签精确进度字段迁移
     let _ = sqlx::query("ALTER TABLE bookmarks ADD COLUMN precise_progress REAL")
         .execute(&*pool)
@@ -263,7 +274,13 @@ pub async fn init_database(db: DbState<'_>) -> Result<(), Error> {
     .execute(&*pool)
     .await?;
 
-    sqlx::query("INSERT OR IGNORE INTO groups (id, name, book_count) VALUES (1, '默认分组', 0)")
+    // 清理基线遗留的「默认分组」种子分组（仅空组时删除）：
+    // 基线在每次启动时用 INSERT OR IGNORE 重新插入 id=1 的「默认分组」，
+    // 导致用户删除后重启即复活（表现为无法删除）。分组现为用户自管的
+    // 持久容器（见 T16 语义变更），不再需要种子；id 为 AUTOINCREMENT
+    // 单调递增不复用，此语句在 id=1 被删除后永久成为空操作。
+    // 含书的保护：仅删除空分组，书籍数据不受影响。
+    sqlx::query("DELETE FROM groups WHERE id = 1 AND book_count = 0")
         .execute(&*pool)
         .await?;
 
@@ -589,6 +606,18 @@ pub async fn delete_book(
                 }
                 Err(e) => {
                     eprintln!("[delete_book] Failed to delete local file {}: {}", book.file_path, e);
+                }
+            }
+        }
+
+        // NAS 缓存书：删除记录时同步清理缓存文件（缓存非用户原始文件，随书籍删除）
+        if book.source.as_deref() == Some("nas") {
+            match tokio::fs::remove_file(&book.file_path).await {
+                Ok(_) => {
+                    println!("[delete_book] Deleted nas cache file: {}", book.file_path);
+                }
+                Err(e) => {
+                    eprintln!("[delete_book] Failed to delete nas cache file {}: {}", book.file_path, e);
                 }
             }
         }

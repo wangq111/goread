@@ -10,8 +10,11 @@ mod tts;
 mod tts_commands;
 mod txt_commands;
 mod mobi_commands;
+mod wifi_transfer;
 
 // 导入所有命令
+use wifi_transfer::{wifi_list_uploads, wifi_stage_to_library, wifi_transfer_start, wifi_transfer_status, wifi_transfer_stop};
+use commands::webdav::{nas_cache_clear, nas_cache_stats, nas_open_remote, webdav_download, webdav_list};
 use commands::{
     add_book,
     // bookmark commands
@@ -44,6 +47,7 @@ use commands::{
     frontend_log,
     get_all_books,
     get_all_groups,
+    find_group_by_name,
     get_bookmarks,
     get_books_by_date_range,
     get_books_by_group,
@@ -316,6 +320,8 @@ pub fn run() {
         .plugin(tauri_plugin_ios_bridge::init())
         .setup(|app| {
             app.manage(Arc::new(ManagedTtsSessionState::new()));
+            // 初始化 WiFi 传书状态（服务默认未启动）
+            app.manage(wifi_transfer::WifiTransferState::new());
             // 设置数据库连接
             tauri::async_runtime::block_on(async {
                 let app_data_dir = app.path().app_data_dir().unwrap();
@@ -404,6 +410,7 @@ pub fn run() {
             rename_book,
             add_group,
             get_all_groups,
+            find_group_by_name,
             update_group,
             delete_group,
             get_books_by_group,
@@ -427,6 +434,18 @@ pub fn run() {
             batch_read_files,
             batch_import_books,
             batch_get_pdf_info,
+            // WiFi 传书命令
+            wifi_transfer_start,
+            wifi_transfer_stop,
+            wifi_transfer_status,
+            wifi_stage_to_library,
+            wifi_list_uploads,
+            // NAS WebDAV 命令
+            webdav_list,
+            webdav_download,
+            nas_open_remote,
+            nas_cache_stats,
+            nas_cache_clear,
             frontend_log,
             read_file_base64,
             read_file_chunked,

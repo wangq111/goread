@@ -42,6 +42,18 @@ export class TauriGroupService implements IGroupService {
     return await invoke('get_all_groups');
   }
 
+  /**
+   * 按名称精确查找分组（含空分组；WiFi 自动入库固定分组查重专用）
+   *
+   * @param name 分组名称（精确匹配）
+   * @returns 命中的分组；不存在返回 null
+   */
+  async findGroupByName(name: string): Promise<IGroup | null> {
+    const invoke = await getInvoke();
+    const found = await invoke<IGroup | null>('find_group_by_name', { name });
+    return found ?? null;
+  }
+
   async getBooksByGroup(groupId: number): Promise<IBook[]> {
     const invoke = await getInvoke();
     return await invoke('get_books_by_group', { groupId });

@@ -1,3 +1,6 @@
+// 书架页签类型：最近 / 本地 / 网络书架（nas:<NAS连接id> 动态页签）
+export type BookshelfTab = 'recent' | 'all' | `nas:${string}`;
+
 // 书籍数据模型接口
 export interface IBook {
   id: number;
@@ -19,6 +22,9 @@ export interface IBook {
   precise_progress?: number;
   hide_divider?: boolean;
   toc_sort?: number | null;
+  source?: string;         // 书籍来源：'nas'=网络书架缓存书，缺省=本地导入
+  source_conn_id?: string; // NAS 连接 id（source 为 'nas' 时有效）
+  source_path?: string;    // NAS 远端文件路径（source 为 'nas' 时有效）
 }
 
 export interface IGroup {

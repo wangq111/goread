@@ -32,6 +32,15 @@
     "days": "{{count}} 天",
     "updateSuccess": "配置更新完成"
   },
+  "nasCache": {
+    "label": "网络书架缓存",
+    "filesUnit": "个文件",
+    "unavailable": "统计不可用",
+    "clear": "清空",
+    "confirmClear": "确认清空？",
+    "clearSuccess": "已清空 {{count}} 个缓存文件",
+    "clearFailed": "清空失败，请重试"
+  },
   "theme": {
     "label": "阅读主题",
     "light": "亮色",

@@ -1,15 +1,13 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { IGroup } from "../../../types";
 import { groupService, logError } from "../../../services";
-import { buildGroupCoversFromBooks } from "../../../utils/groupImport";
 
 /**
  * 管理分组数据的 Hook
- * 负责分组列表加载、封面获取、过滤
+ * 负责分组列表加载、过滤（分组卡片为文件夹图标占位，不再加载封面）
  */
 export const useGroupsData = (query: string) => {
     const [groups, setGroups] = useState<IGroup[]>([]);
-    const [groupCovers, setGroupCovers] = useState<Record<number, string[]>>({});
 
     const loadGroups = useCallback(async () => {
         try {
@@ -35,34 +33,6 @@ export const useGroupsData = (query: string) => {
             );
     }, [loadGroups]);
 
-    // 加载分组封面
-    useEffect(() => {
-        const run = async () => {
-            try {
-                const entries = await Promise.all(
-                    (groups || []).map(async (g) => {
-                        try {
-                            const list = await groupService.getBooksByGroup(g.id);
-                            const covers = buildGroupCoversFromBooks(list || []);
-                            return [g.id, covers] as [number, string[]];
-                        } catch {
-                            return [g.id, []] as [number, string[]];
-                        }
-                    })
-                );
-                const map: Record<number, string[]> = {};
-                entries.forEach(([id, covers]) => {
-                    map[id] = covers;
-                });
-                setGroupCovers(map);
-            } catch (e) {
-                setGroupCovers({});
-            }
-        };
-        if (groups && groups.length > 0) run();
-        else setGroupCovers({});
-    }, [groups]);
-
     // 基于搜索关键词过滤
     const filteredGroups = useMemo(() => {
         const q = query.trim().toLowerCase();
@@ -74,7 +44,6 @@ export const useGroupsData = (query: string) => {
         groups,
         setGroups,
         loadGroups,
-        groupCovers,
         filteredGroups,
     };
 };
