@@ -32,7 +32,6 @@ targets:
       - path: Assets.xcassets
       - path: Externals
       - path: GoRead_iOS
-      - path: ../../ios-bridge
       - path: assets
         buildPhase: resources
         type: folder

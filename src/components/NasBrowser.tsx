@@ -759,7 +759,6 @@ export const NasBrowser: React.FC<NasBrowserProps> = ({ onImportPaths }) => {
             label={bottomLabel}
             disabled={loading || downloading != null}
             onClick={downloadAndImport}
-            useSafeAreaPadding
           />
         </div>
       )}

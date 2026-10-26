@@ -1,6 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { getSafeAreaInsets } from '../utils/layout';
 import { PageHeader } from './PageHeader';
 import { getVersion } from '@tauri-apps/api/app';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -61,7 +60,6 @@ const LIBRARIES: LibraryInfo[] = [
 
 export const About: React.FC = () => {
   const { t } = useTranslation('about');
-  const safeArea = getSafeAreaInsets();
   const [version, setVersion] = useState<string>('0.1.0');
   const [donateModalVisible, setDonateModalVisible] = useState(false);
 
@@ -348,9 +346,6 @@ export const About: React.FC = () => {
           </div>
         ))}
       </div>
-
-      {/* 底部安全区域 */}
-      <div style={{ height: safeArea.bottom }} />
 
       {/* 捐赠弹窗 */}
       {donateModalVisible && (
