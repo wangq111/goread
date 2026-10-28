@@ -159,7 +159,9 @@ jobs:
             # 产物为未签名 .app, 安装时由用户侧载工具（Sideloadly/AltStore 等）重签
             perl -pi -e 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Automatic;\n\t\t\t\tCODE_SIGNING_ALLOWED = NO;/g' \
               src-tauri/gen/apple/GoRead.xcodeproj/project.pbxproj
-            npx tauri ios build --debug --ci
+            # tauri ios build 末尾的 exportArchive 需要 Apple 账号签名, CI 上必然失败;
+            # 此时 .app 已编译完成（DerivedData）, 容忍该失败由下一步直接取 .app 打包
+            npx tauri ios build --debug --ci || echo "WARN: tauri export step failed (expected without Apple account), .app is built"
           fi
         env:
           DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
@@ -232,6 +234,12 @@ jobs:
               break
             fi
           done
+
+          if [ -z "$APP_PATH" ]; then
+            # tauri ios build 编译产物落在 Xcode DerivedData（export 签名失败不影响 .app）,
+            # 优先从 DerivedData 查找 debug-iphoneos 下的 .app
+            APP_PATH=$(find "$HOME/Library/Developer/Xcode/DerivedData" -name "GoRead.app" -path "*iphoneos*" -type d 2>/dev/null | head -1)
+          fi
 
           if [ -z "$APP_PATH" ]; then
             APP_PATH=$(find src-tauri -name "GoRead.app" -type d 2>/dev/null | head -1)
