@@ -11,6 +11,8 @@ import { Toast } from "./Toast";
 import { Loading } from "./Loading";
 import { ExternalFileOpenPayload } from "../types";
 import { IBookRenderer } from "../services/formats";
+import { EpubRenderer } from "../services/formats/epub/EpubRenderer";
+import { TxtRenderer } from "../services/formats/txt/TxtRenderer";
 import { captureBookmarkPosition } from "./reader/utils/bookmarkPosition";
 import { parseChapterTitle } from "./reader/utils/chapterTitle";
 import { getPlaceholderCanvasSize } from "../utils/canvasPlaceholder";
@@ -30,7 +32,6 @@ import {
   useVerticalScroll,
   useNavigation,
   useAutoScroll,
-  useVolumeNavigation,
   useDomRenderer,
   useInitReader,
   useResizeHandler,
@@ -42,9 +43,13 @@ import {
   useReaderTheme,
   useUndoJump,
   useBookReadingMode,
+  useBookPageTurnEffect,
   useTxtPaging,
   useBookFormatHelper,
   useReaderClick,
+  usePageTurnGesture,
+  usePageTurnSlide,
+  usePageTurnCover,
   useBookPageDivider,
   useDividerVisibility,
   useTocSort,
@@ -95,6 +100,8 @@ export const Reader: React.FC = () => {
   const epubRenderedRef = useRef(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const mainViewRef = useRef<HTMLDivElement>(null);
+  // 覆盖翻页克隆层挂载点（T32）：宿主仅作容器，子节点由 usePageTurnCover 命令式增删
+  const coverLayerHostRef = useRef<HTMLDivElement>(null);
   const verticalScrollRef = useRef<HTMLDivElement>(null);
   // PDF 纵向模式下真正被缩放的容器（页面内容包裹层）
   const zoomContentRef = useRef<HTMLDivElement>(null);
@@ -108,6 +115,13 @@ export const Reader: React.FC = () => {
     book,
     isExternal,
     rendererRef,
+  });
+
+  // 书籍级翻页动画效果管理（T33 按书记忆）：slide=平移 / cover=覆盖 / none=无动画，缺省 slide
+  const { pageTurnEffect, setPageTurnEffect } = useBookPageTurnEffect({
+    book,
+    isExternal,
+    setBook,
   });
 
   const {
@@ -375,12 +389,6 @@ export const Reader: React.FC = () => {
     }
   });
 
-  // 音量键翻页
-  useVolumeNavigation(!!settingsWithTheme.volumeKeyTurnPage, {
-    nextPage: navigation.nextPage,
-    prevPage: navigation.prevPage
-  });
-
   // 窗口调整
   useResizeHandler({
     data: { readingMode, currentPage },
@@ -466,16 +474,177 @@ export const Reader: React.FC = () => {
     zoom.reset();
   }, [bookId, isDomRender, readingMode, isPdf, zoom.reset]);
 
+  // 翻页边界判定（T31/T32 引擎共用）：
+  // TXT 横向章节模式下 currentPage/totalPages 是「章级」序号，用它判页级边界会把
+  // 末章内所有栏误判为书末（拖拽/点击/键盘下一页永远回弹）、首章内所有栏误判为书首；
+  // 改为查询渲染器的章内真实边界。其余格式 currentPage 为页级，维持原判定
+  const canTurnPage = (direction: "next" | "prev"): boolean => {
+    const renderer = rendererRef.current;
+    if (
+      readingMode === "horizontal" &&
+      renderer instanceof TxtRenderer &&
+      renderer.isChapterMode?.()
+    ) {
+      return direction === "next"
+        ? renderer.hasNextPageInChapter()
+        : renderer.hasPrevPageInChapter();
+    }
+    return direction === "next"
+      ? currentPage < totalPages - 0.0001
+      : currentPage > 1.0001;
+  };
+
+  // 平移翻页动画控制器（T31 slide 效果）：
+  // 承接手势层拖拽事件流做跟手/settle 补间/回弹，并为分区点击/键盘翻页提供补间动画路径；
+  // EPUB 多栏走容器平移（补间到 ∓视口宽后提交翻页并归零，视觉无跳变），
+  // PDF/TXT 单页模型走「滑出露底色 → 瞬切 → 对侧滑入」两段式近似
+  const pageTurnSlide = usePageTurnSlide({
+    enabled: readingMode === "horizontal",
+    // transform 宿主：PDF 横向为画布（其 JSX style 不含 transform，无缩放冲突），
+    // 其余横向格式为 DOM 渲染容器（EPUB 多栏滚动容器 / TXT 单页均在其内）
+    getHostElement: () =>
+      readingMode === "horizontal" && !isDomRender
+        ? canvasRef.current
+        : domRenderer.domContainerRef.current,
+    getViewportWidth: () => mainViewRef.current?.clientWidth || window.innerWidth,
+    // EPUB 为多栏连续内容（CSS 多栏 + scrollLeft），其余格式按单页重渲染模型处理
+    isSinglePage: () => !isEpubDom,
+    canTurn: canTurnPage,
+    commitTurn: (direction) => {
+      if (direction === "next") navigation.nextPage();
+      else navigation.prevPage();
+    },
+  });
+
+  // 统一翻页手势层（T30）：触摸拖拽事件流 + settle 判定 + 键盘导航；
+  // T31/T32 起 settle 翻页/回弹的视觉动作由活跃翻页动画引擎承接（默认 cover，可切回 slide）
+  // 覆盖翻页动画控制器（T32）：层叠视口克隆方案，接口与 pageTurnSlide 对齐。
+  // 克隆覆盖上下文：仅 EPUB 多栏章内翻页可克隆（相邻栏内容真实存在同章 DOM 中）；
+  // 跨章边界返回 null 退化为两段式（先 settle 滑出再切章，防克隆破相）；
+  // PDF/TXT 单页模型天然无相邻页内容，直接走两段式位图滑动
+  const pageTurnCover = usePageTurnCover({
+    enabled: readingMode === "horizontal",
+    // 两段式降级路径的 transform 宿主：与 slide 同源
+    getHostElement: () =>
+      readingMode === "horizontal" && !isDomRender
+        ? canvasRef.current
+        : domRenderer.domContainerRef.current,
+    getViewportWidth: () => mainViewRef.current?.clientWidth || window.innerWidth,
+    getOverlayRoot: () => coverLayerHostRef.current,
+    getCloneContext: (direction) => {
+      if (!isEpubDom) return null;
+      const container = domRenderer.domContainerRef.current;
+      if (!container || container.clientWidth <= 0) return null;
+      const step = container.clientWidth;
+      const left = container.scrollLeft;
+      const maxIndex = Math.ceil((container.scrollWidth - container.clientWidth) / step);
+      const idx = Math.round(left / step);
+      // 书首无上一栏 / 章尾无下一栏：克隆取不到相邻内容，退化为两段式
+      if (direction === "next") {
+        if (idx + 1 >= maxIndex) return null;
+        return {
+          source: container,
+          topScrollLeft: left + step,
+          underScrollLeft: null,
+          background: pageBackgroundColor,
+        };
+      }
+      if (idx - 1 < 0) return null;
+      // prev：顶层为当前栏快照（滑出层），底层为上一栏快照（被露出的目标页）
+      return {
+        source: container,
+        topScrollLeft: left,
+        underScrollLeft: left - step,
+        background: pageBackgroundColor,
+      };
+    },
+    canTurn: canTurnPage,
+    commitTurn: (direction) => {
+      if (direction === "next") navigation.nextPage();
+      else navigation.prevPage();
+    },
+  });
+
+  // T33 翻页效果三选一驱动：slide/cover 走对应动画引擎，none=瞬时翻页（现状行为显式化，无动画无锁定）
+  const usePageTurnEngine = pageTurnEffect !== "none";
+  const activePageTurn = pageTurnEffect === "cover" ? pageTurnCover : pageTurnSlide;
+
+  const pageTurnGesture = usePageTurnGesture({
+    viewportRef: mainViewRef,
+    // 缩放态（PDF）禁用翻页手势：单指拖动让位给 zoom 平移，与点击翻页的禁用策略一致
+    enabled:
+      readingMode === "horizontal" && !loading && !(isPdf && zoom.isZoomed),
+    isBlocked: () =>
+      tocOverlayOpen ||
+      modeOverlayOpen ||
+      moreDrawerOpen ||
+      isSeeking ||
+      !contentReady,
+    getSelectionHost: () => mainViewRef.current,
+    getViewportWidth: () => mainViewRef.current?.clientWidth || window.innerWidth,
+    // 键盘与 settle 翻页统一走活跃动画引擎路径（动画中自动跳帧合并）；
+    // none 效果无动画：settle 通过后直接瞬时翻页；
+    // settle 通过时手势层先调本回调（跟手态被引擎忽略），随后 onDragEnd 驱动补间
+    onTurnPrev: () => {
+      if (isPdf && zoom.isZoomed) return;
+      if (!usePageTurnEngine) {
+        navigation.prevPage();
+        return;
+      }
+      activePageTurn.turn("prev");
+    },
+    onTurnNext: () => {
+      if (isPdf && zoom.isZoomed) return;
+      if (!usePageTurnEngine) {
+        navigation.nextPage();
+        return;
+      }
+      activePageTurn.turn("next");
+    },
+    // 鼠标拖拽仅在不可选文本的渲染面启用（PDF 横向画布），缩放态让位给平移手势
+    enableMouseDrag: isPdf && readingMode === "horizontal" && !zoom.isZoomed,
+    // T31：拖拽事件流接入动画控制器（跟手 transform / settle 补间 / 回弹）；
+    // none 效果无动画：拖拽事件流不接引擎（isLocked 恒 false，settle 翻页由 onTurnPrev/Next 直通）
+    isLocked: () => (usePageTurnEngine ? activePageTurn.isLocked() : false),
+    onDragStart: (direction) => {
+      if (usePageTurnEngine) activePageTurn.dragStart(direction);
+    },
+    onDragMove: (deltaX) => {
+      if (usePageTurnEngine) activePageTurn.dragMove(deltaX);
+    },
+    onDragEnd: (result) => {
+      if (usePageTurnEngine) activePageTurn.dragEnd(result);
+    },
+  });
+
+  // EPUB 横向：由统一手势层接管触摸拖拽后，禁用渲染层内部触摸翻页流，避免双重翻页；
+  // 渲染器实例随书籍加载重建（loading 变化）或模式切换，均需同步接管标志
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (renderer instanceof EpubRenderer) {
+      renderer.setTouchGestureTakeover(readingMode === "horizontal");
+    }
+  }, [readingMode, bookId, loading, isExternal, isDomRender]);
+
   const { handleMainViewClick } = useReaderClick({
     readingMode,
     clickTurnPage: settings.clickTurnPage && !(isPdf && zoom.isZoomed),
+    // T31/T32：分区点击翻页走活跃动画引擎路径（动画中自动跳帧合并）；none 效果直通瞬时翻页
     onPrevPage: () => {
       if (isPdf && zoom.isZoomed) return;
-      navigation.prevPage();
+      if (!usePageTurnEngine) {
+        navigation.prevPage();
+        return;
+      }
+      activePageTurn.turn("prev");
     },
     onNextPage: () => {
       if (isPdf && zoom.isZoomed) return;
-      navigation.nextPage();
+      if (!usePageTurnEngine) {
+        navigation.nextPage();
+        return;
+      }
+      activePageTurn.turn("next");
     },
     autoScroll: autoScrollData.autoScroll,
     setAutoScroll: autoScrollData.setAutoScroll,
@@ -483,6 +652,9 @@ export const Reader: React.FC = () => {
       if (isPdf && zoom.shouldSuppressClick()) return;
       setUiVisible((v) => !v);
     },
+    // T30：拖拽手势后点击抑制 + 选中文本态点击消解（点击仅取消选择，不翻页）
+    shouldSuppressClick: pageTurnGesture.shouldSuppressClick,
+    getSelectionHost: () => mainViewRef.current,
   });
 
   const showContentLoadingOverlay =
@@ -658,6 +830,22 @@ export const Reader: React.FC = () => {
               </div>
             </div>
           )}
+
+          {/* T32 覆盖翻页克隆层挂载点：宿主仅作容器（React 不管理其子节点），
+              子层由 usePageTurnCover 命令式增删；pointer-events 关闭保证不拦截交互 */}
+          <div
+            ref={coverLayerHostRef}
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              overflow: "hidden",
+              pointerEvents: "none",
+              zIndex: 30,
+            }}
+          />
         </div>
       </div>
 
@@ -929,6 +1117,9 @@ export const Reader: React.FC = () => {
         }}
         hideDivider={hideDivider}
         onToggleHideDivider={() => setHideDivider(!hideDivider)}
+        readingMode={readingMode}
+        pageTurnEffect={pageTurnEffect}
+        onSetPageTurnEffect={setPageTurnEffect}
       />
 
       {/* 全局 Toast 提示 */}

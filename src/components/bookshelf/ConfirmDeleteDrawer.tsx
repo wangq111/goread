@@ -18,6 +18,10 @@ const ConfirmDeleteDrawer: React.FC<ConfirmDeleteDrawerProps> = ({
   onCancel,
   onConfirm,
 }) => {
+  // Hooks 必须在条件 return 之前调用：本组件常驻挂载（open 控制渲染），
+  // 若 useState 放在 return null 之后，open 在 false/true 间切换会导致
+  // hooks 数量 0↔1 跳变，违反 React Hooks 规则，确认删除回调不生效
+  const [deleteLocal, setDeleteLocal] = React.useState(false);
   if (!open) return null;
   const { t } = useTranslation("bookshelf");
   const title = t("deleteDrawer.title");
@@ -27,8 +31,6 @@ const ConfirmDeleteDrawer: React.FC<ConfirmDeleteDrawerProps> = ({
       : context === "all"
         ? t("deleteDrawer.descAll", { count })
         : t("deleteDrawer.descGroupDetail", { count });
-
-  const [deleteLocal, setDeleteLocal] = React.useState(false);
 
   return (
     <div

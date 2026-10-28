@@ -19,6 +19,7 @@ pub struct Book {
     pub theme: Option<String>,
     pub font_size: Option<i64>,
     pub reading_mode: Option<String>, // 阅读模式：horizontal=横向分页，vertical=纵向滚动
+    pub page_turn_effect: Option<String>, // 翻页动画效果：slide=平移，cover=覆盖，none=无动画（按书记忆，仅横向模式生效）
     pub precise_progress: Option<f64>,
     pub hide_divider: Option<bool>,
     pub toc_sort: Option<i64>,
@@ -73,6 +74,7 @@ pub struct ReaderSettings {
     pub render_quality: String, // "low", "medium", "high"
     pub keep_screen_on: bool,
     pub auto_save_progress: bool,
+    pub page_turn_effect: String, // 翻页动画效果：slide=平移，cover=覆盖，none=无动画（默认 slide，仅横向模式生效）
 }
 
 // ==================== 阅读统计相关模型 ====================

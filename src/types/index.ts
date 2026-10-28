@@ -1,6 +1,9 @@
 // 书架页签类型：最近 / 本地 / 网络书架（nas:<NAS连接id> 动态页签）
 export type BookshelfTab = 'recent' | 'all' | `nas:${string}`;
 
+// 翻页动画效果：slide=平移，cover=覆盖，none=无动画（仅横向分页模式生效，默认 slide）
+export type PageTurnEffect = 'slide' | 'cover' | 'none';
+
 // 书籍数据模型接口
 export interface IBook {
   id: number;
@@ -19,6 +22,7 @@ export interface IBook {
   theme?: 'light' | 'dark' | null;
   font_size?: number | null;
   reading_mode?: 'horizontal' | 'vertical' | null; // 阅读模式：horizontal=横向分页，vertical=纵向滚动
+  page_turn_effect?: PageTurnEffect | null; // 翻页动画效果：slide=平移，cover=覆盖，none=无动画（按书记忆，仅横向模式生效）
   precise_progress?: number;
   hide_divider?: boolean;
   toc_sort?: number | null;

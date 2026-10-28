@@ -149,6 +149,11 @@ pub async fn init_database(db: DbState<'_>) -> Result<(), Error> {
         .execute(&*pool)
         .await;
 
+    // 翻页动画效果字段迁移（按书记忆；slide=平移，cover=覆盖，none=无动画，默认平移）
+    let _ = sqlx::query("ALTER TABLE books ADD COLUMN page_turn_effect TEXT DEFAULT 'slide'")
+        .execute(&*pool)
+        .await;
+
     // 隐藏页分隔线字段迁移
     let _ = sqlx::query("ALTER TABLE books ADD COLUMN hide_divider INTEGER DEFAULT 0")
         .execute(&*pool)
@@ -460,6 +465,33 @@ pub async fn update_book_reading_mode(
 
     sqlx::query("UPDATE books SET reading_mode = ? WHERE id = ?")
         .bind(reading_mode.as_deref())
+        .bind(id)
+        .execute(&*pool)
+        .await?;
+
+    Ok(())
+}
+
+/// 更新书籍的翻页动画效果（按书记忆持久化）
+/// - 参数 id：书籍 id
+/// - 参数 page_turn_effect：翻页效果，合法值 "slide"（平移）/"cover"（覆盖）/"none"（无动画），None 表示清空回默认
+/// - 返回：成功 Ok(())，非法值返回错误
+#[tauri::command]
+pub async fn update_book_page_turn_effect(
+    id: i64,
+    page_turn_effect: Option<String>,
+    db: DbState<'_>,
+) -> Result<(), Error> {
+    let pool = db.lock().await;
+
+    if let Some(e) = page_turn_effect.as_deref() {
+        if e != "slide" && e != "cover" && e != "none" {
+            return Err(Error::Message("Invalid page turn effect".to_string()));
+        }
+    }
+
+    sqlx::query("UPDATE books SET page_turn_effect = ? WHERE id = ?")
+        .bind(page_turn_effect.as_deref())
         .bind(id)
         .execute(&*pool)
         .await?;

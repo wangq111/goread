@@ -40,7 +40,6 @@ export const SETTINGS_SAVE_DEBOUNCE_MS = 100;
 
 // 默认设置
 export const DEFAULT_SETTINGS = {
-  volumeKeyTurnPage: false,
   clickTurnPage: true,
   showStatusBar: false,
   recentDisplayCount: 9,

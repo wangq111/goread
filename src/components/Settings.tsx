@@ -595,22 +595,6 @@ export const Settings: React.FC = () => {
           }}
         >
         <Row
-          label={t('volumeKeyTurnPage')}
-          right={
-            <input
-              className="settings-toggle"
-              type="checkbox"
-              checked={settings.volumeKeyTurnPage}
-              onChange={(e) =>
-                setSettings((s) => ({
-                  ...s,
-                  volumeKeyTurnPage: e.target.checked,
-                }))
-              }
-            />
-          }
-        />
-        <Row
           label={t('clickTurnPage')}
           right={
             <input

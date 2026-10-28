@@ -12,7 +12,6 @@ export type LanguageSetting = 'zh' | 'en' | 'system';
 
 // 阅读器设置类型
 export type ReaderSettings = {
-  volumeKeyTurnPage: boolean;
   clickTurnPage: boolean;
   showStatusBar: boolean;
   recentDisplayCount: number;
