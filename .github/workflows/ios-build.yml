@@ -146,9 +146,8 @@ jobs:
         env:
           DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
 
-      - name: Generate Xcode project
-        run: npx tauri ios xcode-project
-
+      # 说明: tauri ios build 会自动复用仓库内已提交的 src-tauri/gen/apple 工程
+      # （tauri-cli 2.x 无 xcode-project 子命令，旧工程 pbxproj 引用自洽可直接构建）
       - name: Build iOS
         run: |
           BUILD_FLAGS="--debug"

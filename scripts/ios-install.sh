@@ -93,13 +93,10 @@ fi
 
 echo -e "Team ID: ${YELLOW}${TEAM_ID}${NC}"
 
-# ---------- 3. 重新生成 Xcode 工程（确保 project.yml 变更生效）----------
-echo -e "${YELLOW}正在重新生成 Xcode 工程...${NC}"
-npx tauri ios xcode-project
-
-# ---------- 4. 构建 iOS 安装包 ----------
+# ---------- 3. 构建 iOS 安装包 ----------
 echo -e "${YELLOW}正在构建 iOS 安装包（Debug 模式，编译时间较长）...${NC}"
 echo -e "  首次编译 Rust 后端约 5-15 分钟，后续增量编译较快"
+echo -e "  说明: tauri ios build 会自动复用仓库内已提交的 src-tauri/gen/apple 工程"
 npx tauri ios build \
     --debug \
     --team-id "$TEAM_ID" \
@@ -112,7 +109,7 @@ if [ $BUILD_EXIT -ne 0 ]; then
     exit 1
 fi
 
-# ---------- 5. 安装到设备 ----------
+# ---------- 4. 安装到设备 ----------
 echo -e "${YELLOW}正在安装到已连接的 iPhone...${NC}"
 
 # 查找 .app 文件
@@ -155,7 +152,7 @@ else
     echo "  2. 选择你的 iPhone → 找到 GoRead → Install"
 fi
 
-# ---------- 6. 提示 ----------
+# ---------- 5. 提示 ----------
 echo ""
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}✓ iOS 构建完成！${NC}"
