@@ -150,15 +150,17 @@ jobs:
       # （tauri-cli 2.x 无 xcode-project 子命令，旧工程 pbxproj 引用自洽可直接构建）
       - name: Build iOS
         run: |
-          BUILD_FLAGS="--debug"
           if [ -n "$DEVELOPMENT_TEAM" ]; then
-            BUILD_FLAGS="$BUILD_FLAGS --team-id $DEVELOPMENT_TEAM"
+            npx tauri ios build --debug --team-id "$DEVELOPMENT_TEAM"
           else
-            # CI runner 无 Apple ID 账号与描述文件: 未签名构建（xcodebuild 禁签透传），
-            # 安装到设备由用户侧载工具（Sideloadly/AltStore 等）用其 Apple ID 重签
-            BUILD_FLAGS="$BUILD_FLAGS -- CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO"
+            # CI runner 无 Apple ID 账号与描述文件: 向 pbxproj 注入禁签配置后构建
+            # 说明: tauri-cli 2.9.2 的 build 阶段硬编码 xcodebuild 参数, 无法透传
+            # CODE_SIGNING_ALLOWED, 故直接改工程文件（仅 CI 工作区, 不提交）;
+            # 产物为未签名 .app, 安装时由用户侧载工具（Sideloadly/AltStore 等）重签
+            perl -pi -e 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Automatic;\n\t\t\t\tCODE_SIGNING_ALLOWED = NO;/g' \
+              src-tauri/gen/apple/GoRead.xcodeproj/project.pbxproj
+            npx tauri ios build --debug --ci
           fi
-          npx tauri ios build $BUILD_FLAGS
         env:
           DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
 
