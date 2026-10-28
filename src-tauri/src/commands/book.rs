@@ -194,25 +194,68 @@ pub async fn init_database(db: DbState<'_>) -> Result<(), Error> {
         .execute(&*pool)
         .await;
 
-    // 首次升级时迁移：按 last_read_time 初始化 recent_order
-    let needs_migration: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM books WHERE recent_order IS NOT NULL")
-            .fetch_one(&*pool)
-            .await?;
+    // 一次性迁移标记表（供下方各一次性迁移使用）
+    let _ = sqlx::query("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY)")
+        .execute(&*pool)
+        .await;
 
-    if needs_migration == 0 {
+    // 一次性迁移：按 last_read_time 初始化 recent_order（老库升级首迁）
+    // 判定依据必须用 schema_migrations 标记而非「recent_order 全空」计数：
+    // 「最近」页删除的本质是 clear_recent 将 recent_order 置 NULL（阅读历史保留），
+    // 用户清空最近列表后全库 recent_order 计数归零，若按计数判定会被误认为
+    // 从未迁移的老库，重新按 last_read_time 分配 recent_order，导致已移除的
+    // 书籍复活重现。标记保证此迁移仅执行一次，与用户数据状态解耦。
+    let recent_order_migrated: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM schema_migrations WHERE name = 'recent_order_backfill'",
+    )
+    .fetch_optional(&*pool)
+    .await
+    .unwrap_or(None);
+
+    if recent_order_migrated.is_none() {
         // 按 last_read_time 倒序，给每本有阅读记录的书分配 recent_order
         sqlx::query(
             "UPDATE books SET recent_order = (
-                SELECT COUNT(*) FROM books b2 
-                WHERE b2.last_read_time IS NOT NULL 
-                AND (b2.last_read_time < books.last_read_time 
+                SELECT COUNT(*) FROM books b2
+                WHERE b2.last_read_time IS NOT NULL
+                AND (b2.last_read_time < books.last_read_time
                      OR (b2.last_read_time = books.last_read_time AND b2.id < books.id))
             ) + 1
             WHERE last_read_time IS NOT NULL",
         )
         .execute(&*pool)
         .await?;
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('recent_order_backfill')",
+        )
+        .execute(&*pool)
+        .await;
+    }
+
+    // 一次性迁移：阅读默认值调整（书籍默认横向阅读；纵向阅读默认隐藏分隔线）
+    // 历史版本通过列 DEFAULT 将 reading_mode 回填为 'vertical'、hide_divider 回填为 0，
+    // 与用户显式设置值无法区分；此迁移将历史默认回填值清空为 NULL，
+    // 交由前端按新产品默认（横向 / 隐藏分隔线）处理。
+    // 通过 schema_migrations 标记保证只执行一次，此后用户显式设置不会被清除。
+    let reading_defaults_migrated: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM schema_migrations WHERE name = 'reading_defaults_horizontal'",
+    )
+    .fetch_optional(&*pool)
+    .await
+    .unwrap_or(None);
+
+    if reading_defaults_migrated.is_none() {
+        let _ = sqlx::query("UPDATE books SET reading_mode = NULL WHERE reading_mode = 'vertical'")
+            .execute(&*pool)
+            .await;
+        let _ = sqlx::query("UPDATE books SET hide_divider = NULL WHERE hide_divider = 0")
+            .execute(&*pool)
+            .await;
+        let _ = sqlx::query(
+            "INSERT INTO schema_migrations (name) VALUES ('reading_defaults_horizontal')",
+        )
+        .execute(&*pool)
+        .await;
     }
 
     // groups 表 sort_order 字段迁移
@@ -319,7 +362,7 @@ pub async fn add_book(
     };
 
     let result = sqlx::query(
-        "INSERT OR IGNORE INTO books (title, file_path, cover_image, total_pages) VALUES (?, ?, ?, ?)"
+        "INSERT OR IGNORE INTO books (title, file_path, cover_image, total_pages, reading_mode, hide_divider) VALUES (?, ?, ?, ?, NULL, NULL)"
     )
     .bind(&title)
     .bind(&path)
@@ -660,22 +703,27 @@ pub async fn delete_book(
         .fetch_one(&*pool)
         .await?;
 
+    // 项目未启用 SQLite 外键级联（PRAGMA foreign_keys 默认关闭），
+    // 删除书籍记录前显式清理书签，避免 bookmarks 残留孤儿记录
+    sqlx::query("DELETE FROM bookmarks WHERE book_id = ?")
+        .bind(id)
+        .execute(&*pool)
+        .await?;
+
     sqlx::query("DELETE FROM books WHERE id = ?")
         .bind(id)
         .execute(&*pool)
         .await?;
 
     if let Some(gid) = old_group {
+        // 分组为「持久容器」（见 T16/v1.7.0 语义）：删除书籍后仅同步 book_count，
+        // 空分组保留显示，由用户手动删除；不随书籍删除自动删除
         sqlx::query(
             "UPDATE groups SET book_count = (SELECT COUNT(*) FROM books WHERE group_id = ?) WHERE id = ?"
         )
         .bind(gid)
         .bind(gid)
         .execute(&*pool).await?;
-        sqlx::query("DELETE FROM groups WHERE id = ? AND book_count = 0")
-            .bind(gid)
-            .execute(&*pool)
-            .await?;
     }
     Ok(())
 }

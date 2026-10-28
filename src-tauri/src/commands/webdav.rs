@@ -7,6 +7,8 @@
 //! 另提供「点击即读」透明缓存通道：`nas_open_remote` 将远端书籍缓存到
 //! `nas_cache/<sha256(连接id|远端路径)>.<扩展名>` 的确定性路径并登记书籍记录，
 //! 阅读进度、书签挂在书籍 id 上，与缓存生命周期解耦。
+//! 每次打开均实时校验远端修改时间（HEAD Last-Modified），NAS 文件更新后
+//! 重新下载同步最新内容（本地缓存 mtime 对齐远端作为比对基准）。
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde::Serialize;
@@ -25,6 +27,12 @@ const PROGRESS_EMIT_INTERVAL: u64 = 256 * 1024;
 
 /// 目录请求总超时（秒）：仅约束 PROPFIND 单次请求
 const LIST_TIMEOUT_SECS: u64 = 30;
+
+/// 缓存新鲜度校验请求超时（秒）：校验失败时退化为直接使用本地缓存（离线优先）
+const FRESHNESS_TIMEOUT_SECS: u64 = 5;
+
+/// 缓存过期判定容差（毫秒）：抵消文件系统修改时间粒度与 HTTP 秒级时间戳误差
+const CACHE_MTIME_TOLERANCE_MS: i64 = 2000;
 
 /// PROPFIND 请求体：请求显示名/大小/修改时间/资源类型四个标准属性
 const PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
@@ -276,7 +284,7 @@ fn parse_propfind_response(xml: &str) -> Result<Vec<WebDavEntry>, String> {
 ///
 /// 参数：base_url 站点根地址；username/password 认证信息（可为 None 匿名）；
 ///       dir_path 站点内目录路径（如 "/" 或 "/books/"）
-/// 返回值：子项列表（目录在前、按名称排序，已剔除目录自身）；失败返回错误说明
+/// 返回值：子项列表（目录在前、按名称排序，已剔除目录自身与群晖回收站 #recycle）；失败返回错误说明
 #[tauri::command]
 pub async fn webdav_list(
     base_url: String,
@@ -317,6 +325,9 @@ pub async fn webdav_list(
     // 剔除目录自身（服务器返回的第一项即被列目录本身）
     let self_key = dir.trim_end_matches('/').to_string();
     entries.retain(|e| e.path.trim_end_matches('/') != self_key);
+
+    // 过滤群晖 NAS 回收站目录（#recycle）：书架与导入页均不应展示回收站内容
+    entries.retain(|e| e.name != "#recycle");
 
     // 排序：目录在前，再按名称（不区分大小写）
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
@@ -386,6 +397,81 @@ async fn download_to_file(
         .await
         .map_err(|e| format!("写入本地文件失败: {}", e))?;
     Ok((downloaded, total))
+}
+
+/// 远端文件状态探测结果
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteMtime {
+    /// 远端文件存在，携带 Last-Modified 解析出的毫秒时间戳
+    Present(i64),
+    /// 远端明确确认文件不存在（HTTP 404/410，通常已在服务器上删除或移动）
+    Missing,
+    /// 无法判定（网络错误、超时、认证失败、服务器错误或未提供 Last-Modified）
+    Unknown,
+}
+
+/// 探测远端文件状态与修改时间（HEAD 请求的 Last-Modified 响应头）
+///
+/// 参数：client HTTP 客户端；url 完整文件地址；username/password 认证信息
+/// 返回值：RemoteMtime 探测结果——区分「远端明确不存在」「存在（含修改时间）」
+///         与「无法判定」三类；仅 404/410 视为明确不存在，其余异常均归入
+///         Unknown 以保持离线优先语义（不因网络故障误删数据）
+async fn probe_remote_mtime(
+    client: &reqwest::Client,
+    url: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> RemoteMtime {
+    let resp = match with_auth(client.head(url), username, password)
+        .timeout(std::time::Duration::from_secs(FRESHNESS_TIMEOUT_SECS))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return RemoteMtime::Unknown,
+    };
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+        return RemoteMtime::Missing;
+    }
+    if !status.is_success() {
+        return RemoteMtime::Unknown;
+    }
+    match resp
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_http_date)
+    {
+        Some(ms) => RemoteMtime::Present(ms),
+        None => RemoteMtime::Unknown,
+    }
+}
+
+/// 判断本地缓存是否已落后于远端文件（需要重新下载同步）
+///
+/// 参数：remote_mtime_ms 远端文件修改时间（毫秒）；local_mtime_ms 本地缓存文件修改时间（毫秒）
+/// 返回值：远端修改时间超出容差地晚于本地缓存时间时返回 true
+fn cache_is_stale(remote_mtime_ms: i64, local_mtime_ms: i64) -> bool {
+    remote_mtime_ms > local_mtime_ms + CACHE_MTIME_TOLERANCE_MS
+}
+
+/// 将本地文件修改时间设置为远端文件修改时间（作为下次新鲜度比对基准）
+///
+/// 两侧比对值均来自远端时钟，本机与 NAS 时钟偏差不影响判定。
+///
+/// 参数：path 本地缓存文件路径；mtime_ms 远端修改时间毫秒时间戳
+async fn set_file_mtime(path: &std::path::Path, mtime_ms: i64) {
+    if mtime_ms < 0 {
+        return;
+    }
+    let system_time =
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime_ms as u64);
+    if let Ok(file) = tokio::fs::OpenOptions::new().write(true).open(path).await {
+        let std_file = file.into_std().await;
+        // 失败静默忽略：仅影响下次同步判定精度，不影响本次打开
+        let _ = std_file.set_modified(system_time);
+    }
 }
 
 /// 从 WebDAV 下载书籍文件到应用数据目录
@@ -481,7 +567,7 @@ pub struct NasOpenResult {
     pub book_id: i64,
     /// 本地缓存文件绝对路径（即 books.file_path）
     pub cache_path: String,
-    /// 本次是否命中既有缓存（true=直接打开，false=新下载）
+    /// 本次是否命中未变化缓存（true=直接打开，false=新下载或远端已更新重新下载）
     pub was_cached: bool,
 }
 
@@ -529,7 +615,7 @@ async fn ensure_nas_book_record(
     }
 
     // 新书记录：file_path UNIQUE 约束 + INSERT OR IGNORE 保证幂等
-    sqlx::query("INSERT OR IGNORE INTO books (title, file_path, total_pages) VALUES (?, ?, 1)")
+    sqlx::query("INSERT OR IGNORE INTO books (title, file_path, total_pages, reading_mode, hide_divider) VALUES (?, ?, 1, NULL, NULL)")
         .bind(title)
         .bind(cache_path)
         .execute(pool)
@@ -550,15 +636,19 @@ async fn ensure_nas_book_record(
     Ok(id)
 }
 
-/// 打开网络书架远端书籍：命中本地缓存直接返回，否则流式下载到确定性缓存路径并登记书籍
+/// 打开网络书架远端书籍：命中未变化缓存直接返回，否则流式下载到确定性缓存路径并登记书籍
 ///
 /// 缓存键为 sha256(连接id|远端路径)，路径与阅读进度解耦于缓存生命周期：
 /// 清空缓存后重新打开会重建同路径文件，books.file_path 持续有效，进度与书签不丢。
+/// 打开时实时探测远端状态（HEAD Last-Modified）：本地缓存落后于远端时重新下载
+/// 同步最新内容；校验失败（离线/服务器不支持）退化为直接使用本地缓存，离线仍可读；
+/// 远端明确确认文件不存在（404/410）时清理本地缓存与书籍记录并返回错误，
+/// 已在服务器上删除的书籍不会再从「最近」中以残留缓存打开。
 ///
 /// 参数：app 应用句柄（数据目录定位与进度事件）；connection_id NAS 连接 id；
 ///       base_url 站点根地址；username/password 认证信息；
 ///       remote_path 站点内文件完整路径；file_name 远端文件名（用于标题与进度展示）
-/// 返回值：NasOpenResult（书籍 id / 缓存路径 / 是否命中缓存）；失败返回错误说明
+/// 返回值：NasOpenResult（书籍 id / 缓存路径 / 是否命中未变化缓存）；失败返回错误说明
 #[tauri::command]
 pub async fn nas_open_remote(
     app: AppHandle,
@@ -594,8 +684,72 @@ pub async fn nas_open_remote(
     ));
     let target_str = target.to_string_lossy().to_string();
 
-    // 缓存命中判定用文件存在性：文件被手动删除时自动重新下载
-    let was_cached = tokio::fs::metadata(&target).await.is_ok();
+    // 下载地址与 HTTP 客户端提前构建：新鲜度校验与可能的重新下载共用
+    let url = format!("{}{}", base, encode_site_path(&remote));
+    let client = build_client()?;
+
+    // 远端文件状态实时探测：文件更新检测的比对基准与存在性确认
+    let remote_state = probe_remote_mtime(
+        &client,
+        &url,
+        username.as_deref(),
+        password.as_deref(),
+    )
+    .await;
+
+    // 远端明确确认文件不存在（404/410，通常已在服务器上删除或移动）：
+    // 清理本地缓存与书籍记录，使其从「最近」与书架中消失，避免继续打开残留缓存。
+    // 仅在服务器明确应答 404/410 时执行删除；网络故障等 Unknown 情况绝不误删。
+    if remote_state == RemoteMtime::Missing {
+        let _ = tokio::fs::remove_file(&target).await;
+        let pool = db.lock().await;
+        // 项目未启用 SQLite 外键级联（PRAGMA foreign_keys 默认关闭），
+        // 删除书籍记录前需显式清理该书签，避免 bookmarks 残留孤儿记录
+        if let Err(e) = sqlx::query(
+            "DELETE FROM bookmarks WHERE book_id IN (SELECT id FROM books WHERE source = 'nas' AND source_conn_id = ? AND source_path = ?)",
+        )
+        .bind(&connection_id)
+        .bind(&remote)
+        .execute(&*pool)
+        .await
+        {
+            eprintln!("[nas_open_remote] 删除已失效书籍书签失败: {}", e);
+        }
+        if let Err(e) = sqlx::query(
+            "DELETE FROM books WHERE source = 'nas' AND source_conn_id = ? AND source_path = ?",
+        )
+        .bind(&connection_id)
+        .bind(&remote)
+        .execute(&*pool)
+        .await
+        {
+            eprintln!("[nas_open_remote] 删除已失效书籍记录失败: {}", e);
+        }
+        return Err("远端文件已不存在（可能已在服务器上删除），已从书架移除".to_string());
+    }
+
+    // 缓存新鲜度比对基准：仅远端存在时才有确定的修改时间
+    let remote_mtime = match remote_state {
+        RemoteMtime::Present(ms) => Some(ms),
+        _ => None,
+    };
+
+    // 缓存命中判定：文件存在且未落后于远端修改时间。
+    // 文件被手动删除时自动重新下载；NAS 上文件已更新时重新下载同步最新内容；
+    // 无法比对（离线或服务器未提供修改时间）时沿用本地缓存（离线优先）。
+    let mut was_cached = false;
+    if let Ok(meta) = tokio::fs::metadata(&target).await {
+        let local_ms = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        let stale = match (remote_mtime, local_ms) {
+            (Some(remote_ms), Some(local_ms)) => cache_is_stale(remote_ms, local_ms),
+            _ => false,
+        };
+        was_cached = !stale;
+    }
 
     if !was_cached {
         tokio::fs::create_dir_all(&cache_dir)
@@ -603,8 +757,6 @@ pub async fn nas_open_remote(
             .map_err(|e| format!("创建缓存目录失败: {}", e))?;
 
         // 流式下载 + 进度事件（复用 goread:nas:download 事件，256KB 节流）
-        let url = format!("{}{}", base, encode_site_path(&remote));
-        let client = build_client()?;
         let mut last_emit: u64 = 0;
         let app_for_progress = app.clone();
         let event_name = safe_name.clone();
@@ -647,6 +799,11 @@ pub async fn nas_open_remote(
                 total,
             },
         );
+
+        // 本地文件修改时间对齐远端：下次打开据此判断是否需要重新同步
+        if let Some(remote_ms) = remote_mtime {
+            set_file_mtime(&target, remote_ms).await;
+        }
     }
 
     // 标题：文件名去扩展名（与本地导入的降级命名一致）
@@ -776,6 +933,18 @@ mod tests {
         resp
     }
 
+    /// 构造 HEAD 响应字节（可选携带 Last-Modified 头）
+    fn head_response(last_modified: Option<&str>) -> Vec<u8> {
+        match last_modified {
+            Some(lm) => format!(
+                "HTTP/1.1 200 OK\r\nLast-Modified: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                lm
+            )
+            .into_bytes(),
+            None => b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        }
+    }
+
     #[test]
     fn test_normalize_helpers() {
         assert_eq!(normalize_base_url(" http://nas:5005/ ").unwrap(), "http://nas:5005");
@@ -860,6 +1029,13 @@ mod tests {
     <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat>
   </D:response>
   <D:response>
+    <D:href>/dav/%23recycle/</D:href>
+    <D:propstat><D:prop>
+      <D:displayname>#recycle</D:displayname>
+      <D:resourcetype><D:collection/></D:resourcetype>
+    </D:prop></D:propstat>
+  </D:response>
+  <D:response>
     <D:href>/dav/a.txt</D:href>
     <D:propstat><D:prop><D:getcontentlength>2</D:getcontentlength><D:resourcetype/></D:prop></D:propstat>
   </D:response>
@@ -885,8 +1061,9 @@ mod tests {
         );
         assert!(request.contains(&expected_auth));
 
-        // 结果校验：目录自身被剔除、目录在前、按名称排序
+        // 结果校验：目录自身与群晖回收站目录（#recycle）被剔除、目录在前、按名称排序
         assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|e| e.name != "#recycle"));
         assert!(entries[0].is_dir);
         assert_eq!(entries[0].name, "中文目录");
         assert_eq!(entries[0].path, "/dav/中文目录/");
@@ -993,6 +1170,8 @@ mod tests {
                 precise_progress REAL,
                 theme TEXT,
                 font_size INTEGER,
+                reading_mode TEXT DEFAULT 'vertical',
+                hide_divider INTEGER DEFAULT 0,
                 created_at INTEGER DEFAULT (strftime('%s', 'now')),
                 source TEXT,
                 source_conn_id TEXT,
@@ -1025,5 +1204,75 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(row, ("nas".into(), "c1".into(), "/books/a.epub".into()));
+    }
+
+    #[test]
+    fn test_cache_is_stale() {
+        // 容差内（含相等）视为未过期：抵消 mtime 粒度与 HTTP 秒级时间戳误差
+        assert!(!cache_is_stale(1000, 1000));
+        assert!(!cache_is_stale(3000, 1000));
+        // 超过容差 1ms 即判定过期（NAS 文件已更新）
+        assert!(cache_is_stale(3001, 1000));
+        // 远端更旧（时钟回拨/旧副本）不触发重新下载
+        assert!(!cache_is_stale(999, 1000));
+    }
+
+    #[tokio::test]
+    async fn test_probe_remote_mtime() {
+        // 正常链路：HEAD 请求携带 Basic 认证头，Last-Modified 解析为毫秒时间戳
+        let (base, rx) = spawn_mock_server(head_response(Some("Wed, 21 Oct 2015 07:28:00 GMT")));
+        let state = probe_remote_mtime(
+            &build_client().unwrap(),
+            &format!("{}/dav/a.txt", base),
+            Some("user"),
+            Some("pass"),
+        )
+        .await;
+        assert_eq!(state, RemoteMtime::Present(1445412480000));
+        let request = rx.recv().unwrap();
+        assert!(request.starts_with("HEAD /dav/a.txt HTTP/1.1"));
+        let expected_auth = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("user:pass")
+        );
+        assert!(request.contains(&expected_auth));
+
+        // 服务器未提供 Last-Modified 头：无法判定（离线优先沿用缓存）
+        let (base, _rx) = spawn_mock_server(head_response(None));
+        let state = probe_remote_mtime(
+            &build_client().unwrap(),
+            &format!("{}/a.txt", base),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(state, RemoteMtime::Unknown);
+
+        // 远端不存在（404）：明确判定文件已缺失（服务器端删除场景）
+        let (base, _rx) = spawn_mock_server(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        );
+        let state = probe_remote_mtime(
+            &build_client().unwrap(),
+            &format!("{}/missing.txt", base),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(state, RemoteMtime::Missing);
+
+        // 服务器内部错误（500）：无法判定，保持离线优先（不误删缓存）
+        let (base, _rx) = spawn_mock_server(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        );
+        let state = probe_remote_mtime(
+            &build_client().unwrap(),
+            &format!("{}/broken.txt", base),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(state, RemoteMtime::Unknown);
     }
 }

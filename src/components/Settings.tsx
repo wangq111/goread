@@ -11,6 +11,7 @@ import {
   RECENT_DISPLAY_COUNT_OPTIONS,
   RECENT_DISPLAY_COUNT_UNLIMITED,
   DEFAULT_READING_MODE,
+  DEFAULT_CHAPTER_REGEX,
   SCROLL_SPEED_MIN,
   SCROLL_SPEED_MAX,
   SCROLL_SPEED_STEP,
@@ -42,6 +43,7 @@ import { PageHeader } from "./PageHeader";
 import { exportAppData, importAppData, exitApp } from "../services/dataBackupService";
 import { nasCacheStats, nasCacheClear, formatNasBytes } from "../services/nasService";
 import { Toast } from "./Toast";
+import { txtPreloader } from "../services/formats/txt/txtPreloader";
 import { IconInfo } from "./Icons";
 import { Loading } from "./Loading";
 import { NativeTTSClient, WebSpeechClient } from "../services/tts";
@@ -753,6 +755,60 @@ export const Settings: React.FC = () => {
                 }))
               }
             />
+          }
+        />
+
+        <Row
+          label={t('chapterRegex.label')}
+          right={
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <input
+                type="text"
+                value={settings.txtChapterRegex ?? DEFAULT_CHAPTER_REGEX}
+                placeholder={DEFAULT_CHAPTER_REGEX}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  const prev = (settings.txtChapterRegex ?? DEFAULT_CHAPTER_REGEX).trim();
+                  setSettings((s) => ({ ...s, txtChapterRegex: value }));
+                  // 章节划分规则变化后，清空按旧规则预加载的 TXT 缓存
+                  if (value.trim() !== prev) {
+                    txtPreloader.clearAll();
+                  }
+                }}
+                style={{
+                  width: 180,
+                  padding: "4px 8px",
+                  fontSize: 13,
+                  border: "1px solid #ddd",
+                  borderRadius: 6,
+                  color: "#333",
+                  outline: "none",
+                }}
+              />
+              <button
+                style={{
+                  padding: SETTINGS_BUTTON_PADDING,
+                  fontSize: SETTINGS_BUTTON_FONT_SIZE,
+                  borderRadius: SETTINGS_BUTTON_RADIUS,
+                  fontWeight: SETTINGS_BUTTON_FONT_WEIGHT,
+                  border: "1px solid #d15158",
+                  background: "#fff",
+                  color: "#d15158",
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                }}
+                onClick={() => {
+                  const current = (settings.txtChapterRegex ?? DEFAULT_CHAPTER_REGEX).trim();
+                  setSettings((s) => ({ ...s, txtChapterRegex: DEFAULT_CHAPTER_REGEX }));
+                  if (current !== DEFAULT_CHAPTER_REGEX) {
+                    txtPreloader.clearAll();
+                    setToastMessage(t('chapterRegex.resetSuccess'));
+                  }
+                }}
+              >
+                {t('chapterRegex.reset')}
+              </button>
+            </div>
           }
         />
 

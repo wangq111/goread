@@ -22,7 +22,7 @@ import { FormatFilterButton } from "./FormatFilterButton";
 import { ImportBottomBar } from "./ImportBottomBar";
 import { useImportedBooks, useImportGrouping, useSearchOverlay, useSelectAll, useOverlayBackHandler } from "../hooks";
 import { checkStoragePermission as checkStoragePermissionUtil } from "../utils/storagePermission";
-import { logError } from "../services";
+import { logError, groupService } from "../services";
 import { importPathsAuto } from "../services/importRunner";
 import { useScanFormats } from "../hooks/useScanFormats";
 import { ScanFormatSelector } from "./ScanFormatSelector";
@@ -44,9 +44,33 @@ const fmtDate = (t?: number) => {
   return `${y}/${m}/${day} ${hh}:${mm}`;
 };
 
+/**
+ * 解析 WiFi 传书事件携带的分组 ID 为书架有效分组 ID（二次校验，防窗口期删组悬空）
+ *
+ * @param groupId 事件携带的分组 ID；null/undefined 表示不分组
+ * @returns 书架中仍存在的分组 ID；分组已失效或校验失败时回退 null（不分组）
+ */
+const resolveWifiTargetGroup = async (
+  groupId?: number | null
+): Promise<number | null> => {
+  if (groupId == null) return null;
+  try {
+    const groups = await groupService.getAllGroups();
+    if (groups.some((g) => g.id === groupId)) return groupId;
+    await logError("WiFi 传书指定分组已不存在，回退为不分组", { groupId });
+  } catch (e) {
+    await logError("校验 WiFi 传书目标分组失败，回退为不分组", {
+      groupId,
+      error: String(e),
+    });
+  }
+  return null;
+};
+
 export const ImportFiles: React.FC = () => {
   const { t } = useTranslation('bookshelf');
   const { t: tc } = useTranslation('common');
+  const { t: ti } = useTranslation('import');
   const { scanFormats, setScanFormats } = useScanFormats();
   const nav = useAppNav();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -81,11 +105,12 @@ export const ImportFiles: React.FC = () => {
   useEffect(() => {
     const unlisten = listen<ReceivedFile>("goread:wifi:received", (e) => {
       const file = e.payload;
-      // 服务端已把文件移入应用书库目录 library/，这里静默导入书架根目录（不自动建分组）；
+      // 服务端已把文件移入应用书库目录 library/，这里按网页端所选分组静默导入，
+      // 对应书籍直接进入书架同源分组（分组数据与网页端共享同一 SQLite）；
       // 导入失败时降级进入“待导入”手动列表，可在 WiFi 传书页重试导入或删除
       autoImportQueueRef.current = autoImportQueueRef.current
         .then(async () => {
-          await importPathsAuto([file.path], null);
+          await importPathsAuto([file.path], await resolveWifiTargetGroup(file.group_id));
         })
         .catch(async (err) => {
           await logError("WiFi 自动入库失败，转入手动待导入列表", {
@@ -1134,6 +1159,7 @@ const Tabs: React.FC = () => {
           onNewGroupNameChange={(val) => setNewGroupName(val)}
           onChooseExistingGroup={openChooseGroup}
           onConfirmName={() => createGroupAndFinish(newGroupName)}
+          onImportToRoot={() => assignToGroupAndFinish(null)}
           loading={groupingLoading}
         />
       )}
@@ -1145,6 +1171,8 @@ const Tabs: React.FC = () => {
         groupPreviews={groupPreviews}
         onClose={() => setChooseGroupOpen(false)}
         onSelectGroup={assignToGroupAndFinish}
+        onSelectRoot={() => assignToGroupAndFinish(null)}
+        rootLabel={ti('bookshelfRoot')}
       />
     </div>
   );

@@ -1,4 +1,4 @@
-import { bookService, groupService, getInvoke, log, logError, getReaderSettings } from "./index";
+import { bookService, groupService, getInvoke, log, logError, getReaderSettings, getTxtChapterRegex } from "./index";
 import { READER_FONT_SIZE_DEFAULT } from "../constants/font";
 import { DEFAULT_READING_MODE } from "../constants/config";
 import { pathToTitle, waitNextFrame } from "./importUtils";
@@ -238,7 +238,7 @@ async function importEpubBook(filePath: string, _invoke: any, _logError: any, _o
 async function importTxtBook(filePath: string, invoke: any, logError: any): Promise<ImportResult> {
   let info: any = null;
   try {
-    info = await (await invoke)('txt_load_document', { filePath });
+    info = await (await invoke)('txt_load_document', { filePath, chapterRegex: getTxtChapterRegex() ?? null });
   } catch (err) {
     await logError('txt_load_document failed during import', { error: String(err), filePath });
   }

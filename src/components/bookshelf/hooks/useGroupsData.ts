@@ -12,8 +12,9 @@ export const useGroupsData = (query: string) => {
     const loadGroups = useCallback(async () => {
         try {
             const allGroups = await groupService.getAllGroups();
-            // 后端已按 sort_order 排序，直接使用
-            setGroups(allGroups || []);
+            // 分组统一按名称 A→Z 排序（中文按拼音），不再使用 sort_order 手动排序
+            const collator = new Intl.Collator("zh-Hans-CN");
+            setGroups((allGroups || []).sort((a, b) => collator.compare(a.name || "", b.name || "")));
         } catch (error) {
             await logError('加载分组列表失败', { error: String(error) });
             setGroups([]);

@@ -33,7 +33,6 @@ import { GroupDetailOverlay } from "./bookshelf/GroupDetailOverlay";
 import FolderCover from "./bookshelf/FolderCover";
 import ConfirmDeleteDrawer from "./bookshelf/ConfirmDeleteDrawer";
 import CreateGroupDialog from "./bookshelf/CreateGroupDialog";
-import { SortableItem } from "./bookshelf/SortableItem";
 import { SortableBookItem } from "./bookshelf/SortableBookItem";
 import { SelectionActionBar } from "./bookshelf/SelectionActionBar";
 import MoveToGroupDrawer from "./bookshelf/MoveToGroupDrawer";
@@ -113,8 +112,6 @@ export const Bookshelf: React.FC = () => {
   // 5. 拖拽排序
   const dragSort = useDragSort({
     activeTab,
-    groups,
-    setGroups,
     selectionMode,
     groupOverlayOpen,
     importOpen: false,
@@ -543,6 +540,7 @@ export const Bookshelf: React.FC = () => {
               <NasFileList
                 connection={activeNasConnection}
                 onNotify={(msg) => setToastMsg(msg)}
+                viewMode={viewMode}
               />
             ) : (
               <div
@@ -582,10 +580,6 @@ export const Bookshelf: React.FC = () => {
             <>
             {!query ? (
               viewMode === "grid" ? (
-              <SortableContext
-                items={filteredGroups.map((g) => g.id)}
-                strategy={rectSortingStrategy}
-              >
                 <div
                   style={{
                     display: "grid",
@@ -596,17 +590,14 @@ export const Bookshelf: React.FC = () => {
                   }}
                 >
                   {filteredGroups.map((g) => (
-                    <SortableItem
+                    <div
                       key={g.id}
-                      id={g.id}
-                      disabled={selectionMode}
                       style={{
                         width: "100%",
                         margin: 0,
                         cursor: "pointer",
                         position: "relative",
                       }}
-                      className=""
                     >
                       <div
                         onClick={() => {
@@ -761,10 +752,9 @@ export const Bookshelf: React.FC = () => {
                           </div>
                         </div>
                       </div>
-                    </SortableItem>
+                    </div>
                   ))}
                 </div>
-              </SortableContext>
               ) : (
                 <div>
                   {filteredGroups.map((g) => (

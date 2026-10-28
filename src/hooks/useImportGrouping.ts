@@ -127,7 +127,13 @@ export const useImportGrouping = (options: UseImportGroupingOptions) => {
     }
   };
 
-  const assignToGroupAndFinish = async (groupId: number) => {
+  /**
+   * 分配到指定分组并完成导入（含 WiFi 上传文件暂存）。
+   *
+   * 参数：groupId 目标分组 id；null 表示不分组，书籍直接落在书架根目录
+   * 返回值：无（异步执行导入，失败时弹窗提示并记录日志）
+   */
+  const assignToGroupAndFinish = async (groupId: number | null) => {
     try {
       setGroupingLoading(true);
       setGroupingOpen(false);

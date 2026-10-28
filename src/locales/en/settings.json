@@ -25,6 +25,11 @@
   "ttsNotificationEnable": "Enable",
   "ttsRate": "TTS Speed",
   "unlimited": "Unlimited",
+  "chapterRegex": {
+    "label": "Chapter Regex",
+    "reset": "Reset",
+    "resetSuccess": "Reset successful"
+  },
   "cacheExpiry": {
     "label": "Cache Expiration",
     "unlimitedHint": "Cache never expires. ~256MB per format, least-used content evicted when exceeded.",

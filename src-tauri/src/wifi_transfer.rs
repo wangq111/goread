@@ -5,15 +5,18 @@
 //! 通过网页将书籍文件上传到应用数据目录 `wifi_uploads/`，
 //! 并通过 `goread:wifi:received` 事件逐个通知前端复用现有导入分组流程。
 //!
-//! 网页端 UI 1:1 对齐「有度」电脑端上传页（http://192.168.2.14/ 同款
-//! Bootstrap 3 风格）：page-header 标题、上传/创建文件夹/Refresh 按钮工具条、
-//! 上传进度面板（File Uploads in Progress）、面包屑 + 条纹表格文件列表
-//! （图标/名称(点击重命名)/大小/移动/删除）、创建文件夹与移动弹窗、错误提示条。
+//! 网页端 UI 对齐「有度」电脑端上传页（http://192.168.2.14/ 同款
+//! Bootstrap 3 风格）：page-header 标题、上传/创建分组/Refresh 按钮工具条、
+//! 上传进度面板（File Uploads in Progress）、「导入到分组」下拉 + 条纹表格
+//! 文件列表（图标/名称/大小/下载/删除）、创建分组弹窗、错误提示条。
+//! 分组数据与本地书架同源：网页端建组直读书架 SQLite groups 表（事务保障），
+//! 上传可选携带 group_id，事件透传后由 App 端静默导入对应分组。
 //! 所需 CSS（bootstrap/theme/fileupload/index）与 Glyphicons 字体均内嵌本地提供。
 //!
 //! 安全说明：服务无鉴权，仅应在可信局域网内使用；服务随 WiFi 传书界面生命周期启停。
 //! 所有文件管理接口均限制在上传目录内（含 `..` 的路径直接拒绝）。
 
+use crate::models::Group;
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Multipart, Query, State},
@@ -26,10 +29,11 @@ use futures::stream;
 use local_ip_address::list_afinet_netifas;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, Mutex};
@@ -61,6 +65,8 @@ pub struct ReceivedFile {
     pub path: String,
     /// 文件大小（字节）
     pub size: u64,
+    /// 目标分组 ID（网页端选择「导入到分组」时携带；None 表示不分组）
+    pub group_id: Option<i64>,
 }
 
 /// 上传接口的 JSON 响应
@@ -155,7 +161,8 @@ pub async fn wifi_transfer_start(
         .map_err(|e| format!("获取监听端口失败: {}", e))?
         .port();
 
-    // 构建路由：/ 上传页、/upload 上传接口、/fonts 内嵌字体、/download 下载、/api/* 文件管理接口
+    // 构建路由：/ 上传页、/upload 上传接口、/fonts 内嵌字体、/download 下载、
+    // /api/groups 分组列表、/api/groups/create 创建分组、/api/list 文件列表、/api/delete 删除
     let ctx = ServerContext {
         app: app.clone(),
         upload_dir,
@@ -165,9 +172,9 @@ pub async fn wifi_transfer_start(
         .route("/upload", post(upload_handler))
         .route("/fonts/glyphicons-halflings-regular.woff", get(glyphicon_font))
         .route("/download", get(api_download))
+        .route("/api/groups", get(api_list_groups))
+        .route("/api/groups/create", post(api_create_group))
         .route("/api/list", get(api_list))
-        .route("/api/mkdir", post(api_mkdir))
-        .route("/api/move", post(api_move))
         .route("/api/delete", post(api_delete))
         .with_state(ctx)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
@@ -297,7 +304,7 @@ pub async fn wifi_list_uploads(app: AppHandle) -> Result<Vec<ReceivedFile>, Stri
     while let Ok(entry) = rd.next_entry().await {
         let Some(entry) = entry else { break };
         let path = entry.path();
-        // 仅列出常规文件（子目录是网页端手动创建的文件夹，不在此列）
+        // 仅列出常规文件（历史版本网页端创建的子目录不在此列）
         if !path.is_file() {
             continue;
         }
@@ -307,6 +314,7 @@ pub async fn wifi_list_uploads(app: AppHandle) -> Result<Vec<ReceivedFile>, Stri
             name,
             path: path.to_string_lossy().to_string(),
             size,
+            group_id: None,
         });
     }
     Ok(out)
@@ -518,7 +526,7 @@ fn content_disposition(file_name: &str) -> String {
 }
 
 /// 处理 multipart 文件上传：校验扩展名、清洗文件名、落盘并逐个推送事件。
-/// 表单中可含 "dir" 字段指定目标子目录（相对上传目录，可选）。
+/// 表单中可含 "group_id" 字段指定目标分组（先于文件字段发送；缺省/无效时不分组）。
 ///
 /// 参数：ctx 服务上下文（应用句柄与上传目录）；multipart 请求体
 /// 返回值：JSON 响应（已保存与已跳过列表）；请求格式错误返回 400，写入失败返回 500
@@ -528,8 +536,8 @@ async fn upload_handler(
 ) -> Result<Json<UploadResponse>, (StatusCode, String)> {
     let mut saved: Vec<ReceivedFile> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
-    // 目标子目录（默认上传根目录；multipart 中 "dir" 字段先行时生效）
-    let mut rel_dir = String::new();
+    // 目标分组：解析 group_id 字段并校验分组存在（缺省/失效回退不分组）
+    let mut group_id: Option<i64> = None;
     // 全自动入库：接收文件落盘后立即移入应用书库目录 library/，wifi_uploads 不保留已接收文件
     let lib_dir = ctx
         .app
@@ -548,13 +556,13 @@ async fn upload_handler(
     {
         let field_name = field.name().unwrap_or("").to_string();
 
-        // 目标子目录字段：读取文本内容
-        if field_name == "dir" {
+        // 目标分组字段：读取文本内容并校验分组在书架中存在
+        if field_name == "group_id" {
             let raw = field
                 .text()
                 .await
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("读取目录字段失败: {}", e)))?;
-            rel_dir = sanitize_rel_dir(&raw);
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("读取分组字段失败: {}", e)))?;
+            group_id = resolve_wifi_group(&ctx.app, raw.trim().parse::<i64>().ok()).await;
             continue;
         }
 
@@ -571,16 +579,14 @@ async fn upload_handler(
             continue;
         }
 
-        // 目标目录：上传目录 + 校验后的子目录
-        let target_dir = resolve_in_upload_dir(&ctx.upload_dir, &rel_dir)
-            .map_err(|(code, msg)| (code, msg))?;
-        tokio::fs::create_dir_all(&target_dir)
+        // 落盘目录：上传根目录（服务启动时已创建，入库前暂存）
+        tokio::fs::create_dir_all(&ctx.upload_dir)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("创建目录失败: {}", e)))?;
 
         // 清洗文件名并生成不重名的保存路径
         let safe_name = sanitize_filename(&filename);
-        let target = unique_target(&target_dir, &safe_name).await;
+        let target = unique_target(&ctx.upload_dir, &safe_name).await;
 
         // 流式写入磁盘，避免大文件占用内存
         let mut size: u64 = 0;
@@ -614,11 +620,12 @@ async fn upload_handler(
             }
         };
 
-        // 逐个推送事件，前端静默自动入库
+        // 逐个推送事件，前端静默自动入库（group_id 已在服务端校验存在）
         let received = ReceivedFile {
             name: safe_name,
             path: final_target.to_string_lossy().to_string(),
             size,
+            group_id,
         };
         let _ = ctx.app.emit("goread:wifi:received", &received);
         saved.push(received);
@@ -631,21 +638,14 @@ async fn upload_handler(
     }))
 }
 
-/// 列出上传目录（或其子目录）内容：文件夹在前、名称升序
+/// 列出上传目录内的文件（仅文件，不含子目录；名称不区分大小写升序）
 ///
-/// 参数：params 查询参数（dir 为相对上传目录的子目录，可省略）；ctx 服务上下文
-/// 返回值：JSON {ok, dir, entries:[{name,size,is_dir}]}；非法路径返回 403
+/// 参数：ctx 服务上下文
+/// 返回值：JSON {ok, entries:[{name,size,is_dir}]}（is_dir 恒为 false，兼容旧网页结构）
 async fn api_list(
-    Query(params): Query<HashMap<String, String>>,
     State(ctx): State<ServerContext>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let rel_dir = params.get("dir").map(|s| s.as_str()).unwrap_or("");
-    let target = resolve_in_upload_dir(&ctx.upload_dir, rel_dir)?;
-    if !target.exists() {
-        return Err((StatusCode::NOT_FOUND, "目录不存在".to_string()));
-    }
-
-    let mut rd = tokio::fs::read_dir(&target)
+    let mut rd = tokio::fs::read_dir(&ctx.upload_dir)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("读取目录失败: {}", e)))?;
     let mut entries: Vec<serde_json::Value> = Vec::new();
@@ -658,46 +658,141 @@ async fn api_list(
             .metadata()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("读取文件信息失败: {}", e)))?;
+        // 只列文件：分组化改造后网页端不再有子目录概念
+        if meta.is_dir() {
+            continue;
+        }
         entries.push(json!({
             "name": entry.file_name().to_string_lossy(),
             "size": meta.len(),
-            "is_dir": meta.is_dir(),
+            "is_dir": false,
         }));
     }
-    // 文件夹在前，名称不区分大小写升序
+    // 名称不区分大小写升序
     entries.sort_by(|a, b| {
-        let da = a["is_dir"].as_bool().unwrap_or(false);
-        let db = b["is_dir"].as_bool().unwrap_or(false);
-        db.cmp(&da).then_with(|| {
-            a["name"]
-                .as_str()
-                .unwrap_or("")
-                .to_lowercase()
-                .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
-        })
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
     });
 
     Ok(Json(json!({
         "ok": true,
-        "dir": rel_dir,
         "entries": entries,
     })))
 }
 
-/// 在指定子目录下创建新文件夹
+/// 分组创建请求体
+#[derive(Debug, Deserialize)]
+struct GroupCreateRequest {
+    /// 新分组名称
+    name: String,
+}
+
+/// 列出本地书架全量分组（含空分组，供网页端「导入到分组」下拉选择）
 ///
-/// 参数：ctx 服务上下文；req.dir 相对子目录、req.name 新文件夹名
-/// 返回值：JSON {ok:true}；非法路径/名称返回 400/403，创建失败返回 500
-async fn api_mkdir(
+/// 直读书架 SQLite groups 表，与 App 端书架分组完全同源，
+/// 保证 WiFi 网页端与本地书架两端分组数据一致。
+///
+/// 参数：ctx 服务上下文（经应用句柄访问书架数据库）
+/// 返回值：JSON {ok, groups:[Group]}；数据库不可用返回 500
+async fn api_list_groups(
     State(ctx): State<ServerContext>,
-    Json(req): Json<MkDirRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let safe_name = sanitize_filename(&req.name);
-    let target = resolve_in_upload_dir(&ctx.upload_dir, &req.dir)?;
-    tokio::fs::create_dir_all(target.join(&safe_name))
+    let pool = ctx.app.state::<Arc<Mutex<SqlitePool>>>();
+    let guard = pool.lock().await;
+    // 空分组同样返回：网页端建组后需立即可选（即使还没有书）
+    let groups = sqlx::query_as::<_, Group>(
+        "SELECT * FROM groups ORDER BY sort_order DESC, created_at DESC",
+    )
+    .fetch_all(&*guard)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("读取分组失败: {}", e)))?;
+    Ok(Json(json!({ "ok": true, "groups": groups })))
+}
+
+/// 创建分组（事务内查重+插入，直接落库书架 groups 表，与 App 端书架同步）
+///
+/// 参数：ctx 服务上下文；req.name 新分组名称（trim 后非空、不与现有分组重名）
+/// 返回值：新分组 JSON；名称为空返回 400，重名返回 409，数据库错误返回 500
+async fn api_create_group(
+    State(ctx): State<ServerContext>,
+    Json(req): Json<GroupCreateRequest>,
+) -> Result<Json<Group>, (StatusCode, String)> {
+    let trimmed = req.name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "分组名称不能为空".to_string()));
+    }
+
+    let pool = ctx.app.state::<Arc<Mutex<SqlitePool>>>();
+    let guard = pool.lock().await;
+    // 事务保障：查重与插入原子提交，避免并发创建产生同名分组
+    let mut tx = (&*guard)
+        .begin()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("创建文件夹失败: {}", e)))?;
-    Ok(Json(json!({ "ok": true })))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("开启事务失败: {}", e)))?;
+
+    // 查重含空分组：书架会展示空分组，同名分组不允许重复出现
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM groups WHERE name = ?")
+        .bind(&trimmed)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("查询分组失败: {}", e)))?;
+    if count > 0 {
+        return Err((StatusCode::CONFLICT, "分组名称已存在".to_string()));
+    }
+
+    // 排序基准含空分组，保证全局 sort_order 单调递增（与 App 端 add_group 口径一致）
+    let max_order: Option<i64> = sqlx::query_scalar("SELECT MAX(sort_order) FROM groups")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("查询排序失败: {}", e)))?;
+    let next_order = max_order.unwrap_or(0) + 1;
+
+    let result = sqlx::query("INSERT INTO groups (name, sort_order) VALUES (?, ?)")
+        .bind(&trimmed)
+        .bind(next_order)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("创建分组失败: {}", e)))?;
+    let group_id = result.last_insert_rowid();
+
+    let group = sqlx::query_as::<_, Group>("SELECT * FROM groups WHERE id = ?")
+        .bind(group_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("读取新分组失败: {}", e)))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("提交事务失败: {}", e)))?;
+
+    Ok(Json(group))
+}
+
+/// 解析并校验上传携带的目标分组 ID：分组存在时返回 Some(id)，否则回退 None（不分组）
+///
+/// 参数：app 应用句柄（访问书架数据库）；raw 网页端提交的分组 ID（可缺省）
+/// 返回值：分组存在于书架时为 Some(id)；缺省、不存在或库错误时为 None
+async fn resolve_wifi_group(app: &AppHandle, raw: Option<i64>) -> Option<i64> {
+    let gid = raw?;
+    let pool = app.state::<Arc<Mutex<SqlitePool>>>();
+    let guard = pool.lock().await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM groups WHERE id = ?")
+        .bind(gid)
+        .fetch_one(&*guard)
+        .await
+        .unwrap_or(0);
+    if count > 0 {
+        Some(gid)
+    } else {
+        eprintln!(
+            "[wifi_transfer] 上传指定的分组不存在（id={}），回退为不分组",
+            gid
+        );
+        None
+    }
 }
 
 /// 删除上传目录内的文件或空文件夹（文件夹非空时拒绝）
@@ -728,69 +823,11 @@ async fn api_delete(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// 创建文件夹请求体
-#[derive(Debug, Deserialize)]
-struct MkDirRequest {
-    /// 相对上传目录的子目录（可为空表示根目录）
-    dir: String,
-    /// 新文件夹名称
-    name: String,
-}
-
 /// 删除请求体
 #[derive(Debug, Deserialize)]
 struct DeleteRequest {
-    /// 相对上传目录的文件/文件夹路径
+    /// 相对上传目录的文件路径
     path: String,
-}
-
-/// 移动/重命名请求体
-#[derive(Debug, Deserialize)]
-struct MoveRequest {
-    /// 源相对路径（文件或文件夹）
-    from: String,
-    /// 目标相对路径（不可与源相同、不可位于源目录内部、不可已存在）
-    to: String,
-}
-
-/// 重命名/移动上传目录内的文件或文件夹（仅限上传目录树内）
-///
-/// 参数：ctx 服务上下文；req.from 源相对路径、req.to 目标相对路径
-/// 返回值：JSON {ok:true}；含 `..` 或越界返回 403，源不存在返回 404，
-///         目标已存在/目标位于源内部/路径为空返回 400，移动失败返回 500
-async fn api_move(
-    State(ctx): State<ServerContext>,
-    Json(req): Json<MoveRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let from = resolve_in_upload_dir(&ctx.upload_dir, &req.from)?;
-    let to = resolve_in_upload_dir(&ctx.upload_dir, &req.to)?;
-    let from_clean = sanitize_rel_dir(&req.from);
-    let to_clean = sanitize_rel_dir(&req.to);
-    if from_clean.is_empty() || to_clean.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "路径不能为空".to_string()));
-    }
-    // 禁止将目录移动到其自身内部（含移动到自身原位）
-    if to_clean == from_clean || to_clean.starts_with(&format!("{}/", from_clean)) {
-        return Err((StatusCode::BAD_REQUEST, "非法目标路径".to_string()));
-    }
-    // 源必须存在
-    tokio::fs::metadata(&from)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "源不存在".to_string()))?;
-    // 目标必须不存在（不做覆盖，防止误覆盖丢文件）
-    if tokio::fs::try_exists(&to).await.unwrap_or(false) {
-        return Err((StatusCode::BAD_REQUEST, "目标已存在".to_string()));
-    }
-    // 跨目录移动时兜底确保目标父目录存在
-    if let Some(parent) = to.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("创建目标目录失败: {}", e)))?;
-    }
-    tokio::fs::rename(&from, &to)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("移动失败: {}", e)))?;
-    Ok(Json(json!({ "ok": true })))
 }
 
 /// 将请求的相对子目录安全解析到上传目录内（防止路径穿越）

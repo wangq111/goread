@@ -25,6 +25,11 @@
   "ttsNotificationEnable": "去开启",
   "ttsRate": "听书语速",
   "unlimited": "不限",
+  "chapterRegex": {
+    "label": "章节识别正则",
+    "reset": "重置",
+    "resetSuccess": "重置成功"
+  },
   "cacheExpiry": {
     "label": "缓存有效期",
     "unlimitedHint": "缓存不会过期，每种格式独立缓存上限约 256MB，超出自动淘汰最少使用的内容",

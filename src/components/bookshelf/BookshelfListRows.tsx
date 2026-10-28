@@ -113,6 +113,8 @@ export interface GroupListRowProps {
   onLongPress: () => void;
   /** 点击圆标回调（切换选中态） */
   onToggleSelect: () => void;
+  /** 括号内次级文案：缺省显示「文件N个」，传字符串自定义，传 null 隐藏（如网络书架目录无文件计数） */
+  metaText?: string | null;
 }
 
 /**
@@ -129,6 +131,7 @@ export const GroupListRow: React.FC<GroupListRowProps> = ({
   onClick,
   onLongPress,
   onToggleSelect,
+  metaText,
 }) => {
   const { t } = useTranslation("bookshelf");
   const rowRef = useRef<HTMLDivElement | null>(null);
@@ -153,7 +156,10 @@ export const GroupListRow: React.FC<GroupListRowProps> = ({
           whiteSpace: "nowrap",
         }}
       >
-        {group.name}({t("filesCount", { count: group.book_count })})
+        {group.name}
+        {metaText === null
+          ? ""
+          : `(${metaText ?? t("filesCount", { count: group.book_count })})`}
       </div>
       {/* 选择模式圆标 */}
       {selectable && <SelectionDot selected={selected} onToggle={onToggleSelect} />}

@@ -5,10 +5,10 @@ import {
   PAGE_TURN_CLICK_SUPPRESS_MS,
   PAGE_TURN_DECIDE_THRESHOLD_PX,
   PAGE_TURN_DISTANCE_RATIO,
+  PAGE_TURN_EDGE_IGNORE_PX,
   PAGE_TURN_FLING_VELOCITY,
   PAGE_TURN_SLOPE_FACTOR,
   PAGE_TURN_VELOCITY_WINDOW_MS,
-  SWIPE_EDGE_THRESHOLD,
 } from "../../../constants/interactions";
 
 /** 翻页方向语义：next=向左滑动（看下一页），prev=向右滑动（看上一页） */
@@ -158,8 +158,10 @@ export const usePageTurnGesture = (options: PageTurnGestureOptions): PageTurnGes
       if (o.isBlocked?.()) return true;
       if (o.isLocked?.()) return true;
       if (isInteractiveTarget(target)) return true;
-      // 屏幕左右边缘排除：避免与系统侧滑返回手势冲突（沿用既有阈值）
-      if (x < SWIPE_EDGE_THRESHOLD || x > window.innerWidth - SWIPE_EDGE_THRESHOLD) return true;
+      // 屏幕左右边缘窄条排除：仅让位系统侧滑返回手势（12px），
+      // 不再沿用通用 55px 阈值，否则左/右下角拇指落点的翻页滑动会被整体吞掉；
+      // 若在窄条外仍被系统手势接管，touchcancel 会走既有回弹收尾路径，不会卡死
+      if (x < PAGE_TURN_EDGE_IGNORE_PX || x > window.innerWidth - PAGE_TURN_EDGE_IGNORE_PX) return true;
       // 既有文本选区（用户刚选完字 / 拖拽选区手柄）：手势让位给选区操作
       if (hasActiveSelectionIn(o.getSelectionHost?.() ?? null)) return true;
       return false;

@@ -14,6 +14,8 @@ export type ReceivedFile = {
   name: string;
   path: string;
   size: number;
+  /** 目标分组 ID（网页端选择「导入到分组」时携带；null/缺省表示不分组） */
+  group_id?: number | null;
 };
 
 /**

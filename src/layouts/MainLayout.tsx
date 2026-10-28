@@ -7,6 +7,7 @@ import ImportProgressDrawer from '../components/bookshelf/ImportProgressDrawer';
 import { useImportProgress } from '../components/bookshelf/hooks';
 import { getSafeAreaInsets } from '../utils/layout';
 import { GlobalBottomBar, GLOBAL_NAV_BAR_H } from './GlobalBottomBar';
+import { GlobalToastHost } from '../components/GlobalToastHost';
 
 /** 判定当前路由是否展示全局底部菜单栏（与 GlobalBottomBar 的可见规则保持一致） */
 const isNavRoute = (pathname: string): boolean =>
@@ -72,6 +73,8 @@ export const MainLayout: React.FC = () => {
       />
       {/* 全局底部菜单栏：跨页面固定展示，按路由高亮对应入口（位于转场容器外，转场时不闪动） */}
       <GlobalBottomBar />
+      {/* 全局 Toast 宿主：常驻所有路由（含阅读器），监听全局事件展示应用统一风格提示（替代各模块原生 alert） */}
+      <GlobalToastHost />
     </div>
   );
 };

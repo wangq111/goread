@@ -8,6 +8,8 @@ interface GroupingDrawerProps {
   onNewGroupNameChange: (value: string) => void;
   onChooseExistingGroup: () => void;
   onConfirmName: () => void;
+  /** 可选：点击「不分组，导入到书架根目录」入口回调；传入时在红色分隔线下显示该入口 */
+  onImportToRoot?: () => void;
   loading?: boolean;
 }
 
@@ -18,6 +20,7 @@ const GroupingDrawer: React.FC<GroupingDrawerProps> = ({
   onNewGroupNameChange,
   onChooseExistingGroup,
   onConfirmName,
+  onImportToRoot,
   loading = false,
 }) => {
   const { t } = useTranslation('import');
@@ -162,6 +165,25 @@ const GroupingDrawer: React.FC<GroupingDrawerProps> = ({
         />
         {/* 独立灰色分隔线，增强与操作区的分割感 */}
         <div style={{ height: 2, background: "#d23c3c", marginTop: 8 }} />
+
+        {/* 不分组入口：跳过分组直接导入到书架根目录（仅键盘收起时显示，与操作行同规则） */}
+        {onImportToRoot && !isInputFocused && (
+          <button
+            onClick={onImportToRoot}
+            style={{
+              background: "none",
+              border: "none",
+              color: "#999",
+              cursor: "pointer",
+              padding: 0,
+              fontSize: 13,
+              alignSelf: "flex-start",
+              marginTop: 16,
+            }}
+          >
+            {t('importToRoot')}
+          </button>
+        )}
 
         {!isInputFocused && (
           <div

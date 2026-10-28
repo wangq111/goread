@@ -170,9 +170,9 @@ export const Reader: React.FC = () => {
   const [seekPage, setSeekPage] = useState<number | null>(null);
 
   // 状态栏控制：仅在阅读页内生效，离开时恢复应用默认
-  // 工具栏/目录/模式/更多这些深色浮层会盖住状态栏区域，此时不需要色条、图标用浅色
-  const darkChromeOnStatusBar =
-    uiVisible || isSeeking || tocOverlayOpen || modeOverlayOpen || moreDrawerOpen;
+  // 目录/模式/更多这些深色浮层会盖住状态栏区域，此时不需要色条、图标用浅色；
+  // 顶部/底部工具栏已改为与页面同色，不再视作深色浮层
+  const darkChromeOnStatusBar = tocOverlayOpen || modeOverlayOpen || moreDrawerOpen;
   // 阅读页配色：全屏统一用主题页面底色（正文页、画布四周、让位带都是它），
   // 页面边界靠纸张投影（纸色与底色同色时，投影/描边是唯一的区分手段）
   const pageBackgroundColor = getReaderPageBackground(isThemeSupported ? effectiveTheme : "light");
@@ -467,8 +467,11 @@ export const Reader: React.FC = () => {
   useEffect(() => {
     if (tocOverlayOpen || modeOverlayOpen || moreDrawerOpen) {
       zoom.reset();
+      // 重新进入菜单后，跳转来源已过期：清除挂起的「撤回跳转」，
+      // 避免关闭菜单后悬浮条再次出现（打开菜单仅视觉隐藏、状态仍 active 的旧行为）
+      undoJump.clearUndo();
     }
-  }, [moreDrawerOpen, modeOverlayOpen, tocOverlayOpen, zoom.reset]);
+  }, [moreDrawerOpen, modeOverlayOpen, tocOverlayOpen, zoom.reset, undoJump.clearUndo]);
 
   useEffect(() => {
     zoom.reset();
@@ -863,6 +866,7 @@ export const Reader: React.FC = () => {
 
       <TopBar
         visible={(uiVisible || isSeeking) && !moreDrawerOpen && !tocOverlayOpen && !modeOverlayOpen}
+        theme={effectiveTheme}
         bookTitle={isExternal ? externalTitle : book?.title}
         isFinished={isExternal ? undefined : book?.status === 1}
         onToggleFinish={isExternal ? undefined : navigation.toggleFinish}

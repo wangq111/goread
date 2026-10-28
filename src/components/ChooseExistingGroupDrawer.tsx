@@ -13,6 +13,8 @@ export interface ChooseExistingGroupDrawerProps {
   onSelectGroup: (groupId: number) => void;
   /** 可选：点击「移到根目录」入口回调；传入时在分组网格最前显示该入口 */
   onSelectRoot?: () => void;
+  /** 可选：根目录入口文案；缺省用 group 命名空间的「移到根目录」（导入场景传「书架根目录」） */
+  rootLabel?: string;
 }
 
 const ChooseExistingGroupDrawer: React.FC<ChooseExistingGroupDrawerProps> = ({
@@ -23,6 +25,7 @@ const ChooseExistingGroupDrawer: React.FC<ChooseExistingGroupDrawerProps> = ({
   onClose,
   onSelectGroup,
   onSelectRoot,
+  rootLabel,
 }) => {
   const { t } = useTranslation('import');
   const { t: tg } = useTranslation('group');
@@ -110,7 +113,7 @@ const ChooseExistingGroupDrawer: React.FC<ChooseExistingGroupDrawerProps> = ({
                   <path d="M12 15.5V10.5m0 0l-2.2 2.2M12 10.5l2.2 2.2" stroke="#fff" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
               </div>
-              <div style={{ color: "#333", fontSize: 14 }}>{tg('moveToRoot')}</div>
+              <div style={{ color: "#333", fontSize: 14 }}>{rootLabel || tg('moveToRoot')}</div>
             </button>
           )}
           {groups.map((g) => (

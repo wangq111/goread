@@ -20,6 +20,9 @@ export const SELECTION_LONGPRESS_DELAY_MS = 550;
 // ===== 翻页手势（T30 统一手势层）=====
 // 方向判定死区（px）：位移小于该值不判定方向（区分点击与拖拽）
 export const PAGE_TURN_DECIDE_THRESHOLD_PX = 4;
+// 翻页手势的屏幕边缘忽略阈值（px）：仅排除贴边窄条，让位系统侧滑返回手势；
+// 相比通用 SWIPE_EDGE_THRESHOLD(55) 大幅缩小，避免吞掉左/右下角（拇指常用落点）起步的翻页滑动
+export const PAGE_TURN_EDGE_IGNORE_PX = 12;
 // 方向判定斜率系数：水平位移 > 纵向位移 × 该系数才判定为横向翻页手势
 export const PAGE_TURN_SLOPE_FACTOR = 1.2;
 // settle 翻页的位移比例阈值：拖拽位移超过视口宽 × 该比例即判定翻页

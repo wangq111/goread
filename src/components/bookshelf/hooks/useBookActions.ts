@@ -95,6 +95,8 @@ export const useBookActions = ({
         }
         if (!ok) return;
         await bookService.deleteBook(book.id);
+        // 广播书籍变化事件：驱动「本地」Tab 未分组书籍列表（useUngroupedBooks）等监听者实时刷新
+        window.dispatchEvent(new CustomEvent("goread:books:changed"));
         // 清理 EPUB 相关缓存（预加载、内存、磁盘）
         cacheConfigService.clearCache(book.file_path).catch((err) => {
           logError(`[Bookshelf] 删除书籍后清理缓存失败: ${err}`).catch(() => { });
@@ -139,6 +141,9 @@ export const useBookActions = ({
           await bookService.deleteBook(bid, !!actualDeleteLocal);
         }
         await Promise.all([loadGroups(), loadBooks()]);
+        // 广播分组/书籍变化事件：驱动「本地」Tab 未分组书籍列表（useUngroupedBooks）等监听者实时刷新
+        window.dispatchEvent(new CustomEvent("goread:groups:changed"));
+        window.dispatchEvent(new CustomEvent("goread:books:changed"));
       }
       exitSelection();
     } catch (err) {

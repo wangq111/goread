@@ -1,19 +1,15 @@
-import { useCallback, Dispatch, SetStateAction, MutableRefObject } from "react";
-import { DragEndEvent } from "@dnd-kit/core";
-import { arrayMove } from "@dnd-kit/sortable";
-import { IGroup, BookshelfTab } from "../../../types";
-import { groupService, logError } from "../../../services";
+import { MutableRefObject } from "react";
+import { BookshelfTab } from "../../../types";
 import { useDndSensors, useDragGuard, useTabSwipe, isTouchDevice } from "../../../utils/gesture";
 import { useAppNav } from "../../../router/useAppNav";
 
 /**
- * 管理拖拽排序的 Hook
- * 负责书籍和分组的拖拽排序、顺序持久化、手势处理
+ * 管理拖拽相关手势的 Hook
+ * 分组/书籍顺序已改为固定名称 A→Z 排序，不再支持拖拽重排；
+ * 保留 DnD 传感器、拖拽守卫与页签滑动切换逻辑
  */
 export const useDragSort = (params: {
     activeTab: BookshelfTab;
-    groups: IGroup[];
-    setGroups: Dispatch<SetStateAction<IGroup[]>>;
     selectionMode: boolean;
     groupOverlayOpen: boolean;
     importOpen: boolean;
@@ -23,8 +19,6 @@ export const useDragSort = (params: {
 }) => {
     const {
         activeTab,
-        groups,
-        setGroups,
         selectionMode,
         groupOverlayOpen,
         importOpen,
@@ -34,7 +28,7 @@ export const useDragSort = (params: {
 
     const nav = useAppNav();
 
-    const { dragActive, onDragStart, onDragEnd: onDragEndGuard, onDragCancel } = useDragGuard();
+    const { dragActive, onDragStart, onDragEnd, onDragCancel } = useDragGuard();
 
     // 动态页签序列：最近 → 本地(all) → 各 NAS 连接页签（nas:<id>）
     const tabSequence: BookshelfTab[] = ["recent", "all", ...nasTabIds.map((id): BookshelfTab => `nas:${id}`)];
@@ -61,35 +55,11 @@ export const useDragSort = (params: {
 
     const sensors = useDndSensors(isTouchDevice());
 
-    const handleDragEnd = useCallback(async (event: DragEndEvent) => {
-        const { active, over } = event;
-        if (!over || active.id === over.id) return;
-
-        if (activeTab === "all") {
-            const oldIndex = groups.findIndex((g) => g.id === active.id);
-            const newIndex = groups.findIndex((g) => g.id === over.id);
-            const newItems = arrayMove(groups, oldIndex, newIndex);
-
-            // 立即更新UI
-            setGroups(newItems);
-
-            // 调用后端API持久化排序
-            try {
-                await groupService.reorderGroups(newItems.map((g) => g.id));
-            } catch (e) {
-                await logError('重排序分组失败', { error: String(e) });
-            }
-        }
-    }, [activeTab, groups, setGroups]);
-
     return {
         dragActive,
         sensors,
         onDragStart,
-        onDragEnd: (e: DragEndEvent) => {
-            onDragEndGuard();
-            handleDragEnd(e);
-        },
+        onDragEnd,
         onDragCancel,
         swipeTouchStart,
         swipeTouchEnd,

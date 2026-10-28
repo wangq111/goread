@@ -278,6 +278,7 @@ export const ScanResults: React.FC = () => {
           onNewGroupNameChange={(val) => setNewGroupName(val)}
           onChooseExistingGroup={openChooseGroup}
           onConfirmName={() => createGroupAndFinish(newGroupName)}
+          onImportToRoot={() => assignToGroupAndFinish(null)}
           loading={groupingLoading}
         />
       )}
@@ -289,6 +290,8 @@ export const ScanResults: React.FC = () => {
         groupPreviews={groupPreviews}
         onClose={() => setChooseGroupOpen(false)}
         onSelectGroup={assignToGroupAndFinish}
+        onSelectRoot={() => assignToGroupAndFinish(null)}
+        rootLabel={t('bookshelfRoot')}
       />
 
       <ImportBottomBar
